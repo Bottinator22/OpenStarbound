@@ -327,6 +327,16 @@ void ClientWeather::readUpdate(ByteArray data, NetCompatibilityRules rules) {
   }
 }
 
+void ClientWeather::clear() {
+  m_currentWeatherIndex = NPos;
+  m_currentWeatherType.reset();
+  m_currentWeatherIntensity = 0.0f;
+  m_currentWind = 0.0f;
+  m_visibleRegion = {};
+  m_particles.clear();
+  m_lastParticleVisibleRegion = {};
+}
+
 void ClientWeather::setVisibleRegion(RectI visibleRegion) {
   m_visibleRegion = visibleRegion;
 }
@@ -337,13 +347,13 @@ void ClientWeather::update(double dt) {
   if (m_currentWeatherIndex == NPos) {
     m_currentWeatherType = {};
   } else {
-    if (m_visibleRegion.yMax() > m_undergroundLevel)
+    if (m_visibleRegion == RectI() || m_visibleRegion.yMax() > m_undergroundLevel)
       m_currentWeatherType = Root::singleton().biomeDatabase()->weatherType(m_weatherPool.item(m_currentWeatherIndex));
     else
       m_currentWeatherType = {};
   }
 
-  if (m_currentWeatherType)
+  if (m_currentWeatherType && m_visibleRegion != RectI())
     spawnWeatherParticles(RectF(m_visibleRegion), dt);
 }
 
@@ -371,6 +381,12 @@ StringList ClientWeather::weatherTrackOptions() const {
   return {};
 }
 
+Maybe<String> ClientWeather::weatherParallax() const {
+  if (m_currentWeatherType)
+    return m_currentWeatherType->parallax;
+  return {};
+}
+
 void ClientWeather::getNetStates() {
   if (m_weatherPoolNetState.pullUpdated())
     m_weatherPool = WeatherPool(DataStreamBuffer::deserializeContainer<WeatherPool::ItemsList>(m_weatherPoolNetState.get()));
@@ -387,7 +403,7 @@ void ClientWeather::spawnWeatherParticles(RectF newClientRegion, float dt) {
   for (auto const& particleConfig : m_currentWeatherType->particles) {
     // Move client region to same wrap region as newClientRegion
     RectF visibleRegion(m_worldGeometry.nearestTo(newClientRegion.min(), m_lastParticleVisibleRegion.min()),
-        m_worldGeometry.nearestTo(newClientRegion.min(), m_lastParticleVisibleRegion.max()));
+        m_worldGeometry.nearestTo(newClientRegion.max(), m_lastParticleVisibleRegion.max()));
 
     Vec2F targetVelocity = particleConfig.particle.velocity + Vec2F(wind(), 0);
     float angleChange = Vec2F::angleBetween2(Vec2F(0, 1), targetVelocity);

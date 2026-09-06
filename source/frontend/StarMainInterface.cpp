@@ -486,6 +486,12 @@ void MainInterface::handleInteractAction(InteractAction interactAction) {
           } else if (m_client->playerWorld().is<InstanceWorldId>()) {
             icon = worldTemplate->worldParameters()->typeName;
             planetName = worldTemplate->worldName();
+          } else if (m_client->playerWorld().is<CustomWorldId>()) {
+            icon = worldTemplate->worldParameters()->typeName;
+            planetName = worldTemplate->worldName();
+          } else if (m_client->playerWorld().is<ClientCustomWorldId>()) {
+            icon = worldTemplate->worldParameters()->typeName;
+            planetName = worldTemplate->worldName();
           } else {
             icon = "default";
             planetName = "???";
@@ -670,6 +676,8 @@ void MainInterface::update(float dt) {
     queueItemPickupText(drop);
 
   m_chat->addMessages(m_client->pullChatMessages());
+  for (auto const& result : m_clientCommandProcessor->updatePromises())
+    m_chat->addLine(result);
 
   if (auto worldClient = m_client->worldClient()) {
     if (worldClient->inWorld()) {

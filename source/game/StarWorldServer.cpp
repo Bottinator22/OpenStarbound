@@ -23,7 +23,9 @@
 #include "StarFallingBlocksAgent.hpp"
 #include "StarWarpTargetEntity.hpp"
 #include "StarUniverseSettings.hpp"
+#include "StarUniverseServer.hpp"
 #include "StarUniverseServerLuaBindings.hpp"
+#include "StarCelestialLuaBindings.hpp"
 
 namespace Star {
 
@@ -98,9 +100,59 @@ UniverseSettingsPtr WorldServer::universeSettings() const {
 }
 
 void WorldServer::setReferenceClock(ClockPtr clock) {
-  m_weather.setReferenceClock(clock);
+  for (auto const& pair : m_weatherDomains)
+    pair.second->setReferenceClock(clock);
+  if (m_emptyWeather)
+    m_emptyWeather->setReferenceClock(clock);
   m_sky->setReferenceClock(clock);
   m_referenceClock = clock;
+}
+
+void WorldServer::setupWeatherDomains(bool preserveNonSurface) {
+  auto previousDomains = take(m_weatherDomains);
+  m_weatherDomains.clear();
+
+  auto effectsActive = [this](Vec2I const& pos) {
+    auto const& tile = m_tileArray->tile(pos);
+    return !isRealMaterial(tile.background);
+  };
+
+  for (auto const& domain : m_worldTemplate->weatherDomains()) {
+    if (preserveNonSurface && domain.name != "surface" && previousDomains.contains(domain.name)) {
+      m_weatherDomains.set(domain.name, previousDomains.get(domain.name));
+      continue;
+    }
+
+    auto weather = make_shared<ServerWeather>();
+    weather->setup(domain.pool, domain.effectsMinHeight, m_geometry, effectsActive);
+    weather->setReferenceClock(m_referenceClock);
+    m_weatherDomains.set(domain.name, take(weather));
+  }
+
+  m_emptyWeather = make_shared<ServerWeather>();
+  m_emptyWeather->setup({}, 0, m_geometry, effectsActive);
+  m_emptyWeather->setReferenceClock(m_referenceClock);
+
+  for (auto const& pair : m_clientInfo) {
+    pair.second->weatherDomain.reset();
+    pair.second->weatherNetVersion = 0;
+  }
+}
+
+ServerWeatherPtr WorldServer::weatherForDomain(Maybe<String> const& domain) const {
+  if (domain && m_weatherDomains.contains(*domain))
+    return m_weatherDomains.get(*domain);
+  return m_emptyWeather;
+}
+
+ServerWeatherPtr WorldServer::weatherAt(Vec2F const& position) const {
+  if (auto layer = m_worldTemplate->weatherLayerAt(Vec2I::floor(position)))
+    return weatherForDomain(layer->domain);
+  return m_emptyWeather;
+}
+
+ServerWeatherPtr WorldServer::surfaceWeather() const {
+  return weatherForDomain(String("surface"));
 }
 
 void WorldServer::setPause(bool pause) {
@@ -112,6 +164,7 @@ void WorldServer::setPause(bool pause) {
 
 void WorldServer::initLua(UniverseServer* universe) {
   m_luaRoot->addCallbacks("universe", LuaBindings::makeUniverseServerCallbacks(universe));
+  m_luaRoot->addCallbacks("celestial", LuaBindings::makeCelestialCallbacks(universe));
   auto assets = Root::singleton().assets();
   for (auto& p : assets->json("/worldserver.config:scriptContexts").toObject()) {
     auto scriptComponent = make_shared<ScriptComponent>();
@@ -223,7 +276,8 @@ bool WorldServer::spawnTargetValid(SpawnTarget const& spawnTarget) const {
   return true;
 }
 
-bool WorldServer::addClient(ConnectionId clientId, SpawnTarget const& spawnTarget, bool isLocal, bool isAdmin, NetCompatibilityRules netRules) {
+bool WorldServer::addClient(ConnectionId clientId, SpawnTarget const& spawnTarget, bool isLocal, bool isAdmin, NetCompatibilityRules netRules, ClientSubWorldId subWorldId) {
+  // if on a subworld, assumes connection id is the subworld's connectionid
   if (m_clientInfo.contains(clientId))
     return false;
 
@@ -258,9 +312,13 @@ bool WorldServer::addClient(ConnectionId clientId, SpawnTarget const& spawnTarge
   tracker.update(m_currentTime);
 
   auto& clientInfo = m_clientInfo.add(clientId, make_shared<ClientInfo>(clientId, tracker));
+  clientInfo->subWorldId = subWorldId;
   clientInfo->local = isLocal;
   clientInfo->admin = isAdmin;
   clientInfo->clientState.setNetCompatibilityRules(netRules);
+
+  if (auto layer = m_worldTemplate->weatherLayerAt(Vec2I::floor(playerStart)))
+    clientInfo->weatherDomain = layer->domain;
 
   auto worldStartPacket = make_shared<WorldStartPacket>();
   auto& templateData = worldStartPacket->templateData = m_worldTemplate->store();
@@ -270,7 +328,7 @@ bool WorldServer::addClient(ConnectionId clientId, SpawnTarget const& spawnTarge
     worldStartPacket->templateData = worldStartPacket->templateData.setPath("worldParameters.primaryDungeon", "testarena");
 
   tie(worldStartPacket->skyData, clientInfo->skyNetVersion) = m_sky->writeUpdate(0, netRules);
-  tie(worldStartPacket->weatherData, clientInfo->weatherNetVersion) = m_weather.writeUpdate(0, netRules);
+  tie(worldStartPacket->weatherData, clientInfo->weatherNetVersion) = weatherForDomain(clientInfo->weatherDomain)->writeUpdate(0, netRules);
   worldStartPacket->playerStart = playerStart;
   worldStartPacket->playerRespawn = m_playerStart;
   worldStartPacket->respawnInWorld = m_respawnInWorld;
@@ -293,6 +351,9 @@ bool WorldServer::addClient(ConnectionId clientId, SpawnTarget const& spawnTarge
 List<PacketPtr> WorldServer::removeClient(ConnectionId clientId) {
   auto const& info = m_clientInfo.get(clientId);
 
+  for (auto& p : m_scriptContexts)
+    p.second->invoke("removeClient", clientId);
+
   for (auto const& entityId : m_entityMap->entityIds()) {
     if (connectionForEntity(entityId) == clientId)
       removeEntity(entityId, false);
@@ -312,14 +373,15 @@ List<PacketPtr> WorldServer::removeClient(ConnectionId clientId) {
   }
 
   auto packets = std::move(info->outgoingPackets);
+  auto subWorldId = info->subWorldId;
   m_clientInfo.remove(clientId);
 
   packets.append(make_shared<WorldStopPacket>("Removed"));
-
-  for (auto& p : m_scriptContexts)
-    p.second->invoke("removeClient", clientId);
-
-  return packets;
+  if (subWorldId == MainClientWorldId) {
+    return packets;
+  } else {
+    return {make_shared<ClientSubWorldPackets>(subWorldId,std::move(packets))};
+  }
 }
 
 List<ConnectionId> WorldServer::clientIds() const {
@@ -344,6 +406,14 @@ PlayerPtr WorldServer::clientPlayer(ConnectionId clientId) const {
     return get<Player>(i->second->clientState.playerId());
   else
     return {};
+}
+
+ClientSubWorldId WorldServer::clientSubWorld(ConnectionId clientId) const {
+  auto i = m_clientInfo.find(clientId);
+  if (i != m_clientInfo.end())
+    return i->second->subWorldId;
+  else
+    return 0;
 }
 
 List<EntityId> WorldServer::players() const {
@@ -515,10 +585,14 @@ void WorldServer::handleIncomingPackets(ConnectionId clientId, List<PacketPtr> c
         clientInfo->outgoingPackets.append(make_shared<EntityMessageResponsePacket>(makeLeft("Unknown entity"), entityMessagePacket->uuid));
       } else {
         if (entity->isMaster()) {
-          auto response = entity->receiveMessage(clientId, entityMessagePacket->message, entityMessagePacket->args);
-          if (response)
-            clientInfo->outgoingPackets.append(make_shared<EntityMessageResponsePacket>(makeRight(response.take()), entityMessagePacket->uuid));
-          else
+          if (auto response = entity->receiveMessage(clientId, entityMessagePacket->message, entityMessagePacket->args)) {
+            if (response->is<Json>())
+              clientInfo->outgoingPackets.append(make_shared<EntityMessageResponsePacket>(makeRight(response->get<Json>()), entityMessagePacket->uuid));
+            else {
+              // delay the response until this promise is done
+              m_entityMessagePromises[entityMessagePacket->uuid] = make_pair(clientId,response->get<RpcPromise<Json>>());
+            }
+          } else
             clientInfo->outgoingPackets.append(make_shared<EntityMessageResponsePacket>(makeLeft("Message not handled by entity"), entityMessagePacket->uuid));
         } else if (auto const& clientInfo = m_clientInfo.value(connectionForEntity(entity->entityId()))) {
           m_entityMessageResponses[entityMessagePacket->uuid] = {clientInfo->clientId, clientId};
@@ -573,7 +647,11 @@ void WorldServer::handleIncomingPackets(ConnectionId clientId, List<PacketPtr> c
 
 List<PacketPtr> WorldServer::getOutgoingPackets(ConnectionId clientId) {
   auto const& clientInfo = m_clientInfo.get(clientId);
-  return std::move(clientInfo->outgoingPackets);
+  if (clientInfo->subWorldId == MainClientWorldId) {
+    return std::move(clientInfo->outgoingPackets);
+  } else {
+    return {make_shared<ClientSubWorldPackets>(clientInfo->subWorldId,std::move(clientInfo->outgoingPackets))};
+  }
 }
 
 bool WorldServer::sendPacket(ConnectionId clientId, PacketPtr const& packet) {
@@ -584,8 +662,8 @@ bool WorldServer::sendPacket(ConnectionId clientId, PacketPtr const& packet) {
   return false;
 }
 
-Maybe<Json> WorldServer::receiveMessage(ConnectionId fromConnection, String const& message, JsonArray const& args) {
-  Maybe<Json> result;
+Maybe<ChainableJsonMessageResponse> WorldServer::receiveMessage(ConnectionId fromConnection, String const& message, JsonArray const& args) {
+  Maybe<ChainableJsonMessageResponse> result;
   for (auto& p : m_scriptContexts) {
     result = p.second->handleMessage(message, fromConnection == ServerConnectionId, args);
     if (result)
@@ -618,6 +696,10 @@ void WorldServer::setExpiryTime(float expiryTime) {
 
 float WorldServer::expiryTime() {
   return m_expiryTimer.timer;
+}
+
+List<EntityId> WorldServer::entityIds() const {
+  return m_entityMap->entityIds();
 }
 
 void WorldServer::update(float dt) {
@@ -671,18 +753,30 @@ void WorldServer::update(float dt) {
 
   m_sky->update(dt);
 
-  List<RectI> clientWindows;
+  StringMap<List<RectI>> weatherClientWindows;
   List<RectI> clientMonitoringRegions;
   for (auto const& pair : m_clientInfo) {
-    clientWindows.append(pair.second->clientState.window());
+    auto window = pair.second->clientState.window();
+    if (!window.isEmpty()) {
+      if (auto layer = m_worldTemplate->weatherLayerAt(Vec2I::floor(pair.second->clientState.windowCenter()))) {
+        if (layer->domain) {
+          auto clippedWindow = RectI(window.xMin(), std::max(window.yMin(), layer->minHeight),
+              window.xMax(), std::min(window.yMax(), layer->maxHeight));
+          if (!clippedWindow.isEmpty())
+            weatherClientWindows[*layer->domain].append(clippedWindow);
+        }
+      }
+    }
     for (auto const& region : pair.second->monitoringRegions(m_entityMap))
       clientMonitoringRegions.appendAll(m_geometry.splitRect(region));
   }
 
-  m_weather.setClientVisibleRegions(clientWindows);
-  m_weather.update(dt);
-  for (auto projectile : m_weather.pullNewProjectiles())
-    addEntity(std::move(projectile));
+  for (auto const& pair : m_weatherDomains) {
+    pair.second->setClientVisibleRegions(weatherClientWindows.value(pair.first, {}));
+    pair.second->update(dt);
+    for (auto projectile : pair.second->pullNewProjectiles())
+      addEntity(std::move(projectile));
+  }
 
   if (shouldRunThisStep("liquidUpdate")) {
     m_liquidEngine->setProcessingLimit(m_fidelityConfig.optUInt("liquidEngineBackgroundProcessingLimit"));
@@ -717,6 +811,21 @@ void WorldServer::update(float dt) {
 
   for (EntityId entityId : toRemove)
     removeEntity(entityId, true);
+
+  for (auto const& uuid : m_entityMessagePromises.keys()) {
+    if (auto clientInfo = m_clientInfo.value(m_entityMessagePromises[uuid].first)) {
+      if (m_entityMessagePromises[uuid].second.finished()) {
+        if (m_entityMessagePromises[uuid].second.succeeded()) {
+          clientInfo->outgoingPackets.append(make_shared<EntityMessageResponsePacket>(makeRight(*m_entityMessagePromises[uuid].second.result()), uuid));
+        } else {
+          clientInfo->outgoingPackets.append(make_shared<EntityMessageResponsePacket>(makeLeft(*m_entityMessagePromises[uuid].second.error()), uuid));
+        }
+        m_entityMessagePromises.remove(uuid);
+      }
+    } else {
+      m_entityMessagePromises.remove(uuid);
+    }
+  }
 
   bool sendRemoteUpdates = m_entityUpdateTimer.wrapTick(dt);
   for (auto const& pair : m_clientInfo) {
@@ -1274,10 +1383,7 @@ void WorldServer::setPlanetType(String const& planetType, String const& primaryB
       m_sky = make_shared<Sky>(m_worldTemplate->skyParameters(), false);
       m_sky->setReferenceClock(referenceClock);
 
-      m_weather.setup(m_worldTemplate->weathers(), m_worldTemplate->undergroundLevel(), m_geometry, [this](Vec2I const& pos) {
-        auto const& tile = m_tileArray->tile(pos);
-        return !isRealMaterial(tile.background);
-      });
+      setupWeatherDomains(true);
 
       m_newPlanetType = pair<String, String>{planetType, primaryBiomeName};
     }
@@ -1286,15 +1392,23 @@ void WorldServer::setPlanetType(String const& planetType, String const& primaryB
 
 
 void WorldServer::setWeatherIndex(size_t weatherIndex, bool force) {
-  m_weather.setWeatherIndex(weatherIndex, force);
+  surfaceWeather()->setWeatherIndex(weatherIndex, force);
 }
 
 void WorldServer::setWeather(String const& weatherName, bool force) {
-  m_weather.setWeather(weatherName, force);
+  surfaceWeather()->setWeather(weatherName, force);
+}
+
+void WorldServer::setWeather(Vec2F const& position, String const& weatherName, bool force) {
+  weatherAt(position)->setWeather(weatherName, force);
 }
 
 StringList WorldServer::weatherList() const {
-  return m_weather.weatherList();
+  return surfaceWeather()->weatherList();
+}
+
+StringList WorldServer::weatherList(Vec2F const& position) const {
+  return weatherAt(position)->weatherList();
 }
 
 Maybe<pair<String, String>> WorldServer::pullNewPlanetType() {
@@ -1420,6 +1534,7 @@ void WorldServer::init(bool firstTime) {
   m_lightIntensityCalculator.setParameters(assets->json("/lighting.config:intensity"));
 
   m_entityMessageResponses = {};
+  m_entityMessagePromises = {};
 
   m_collisionGenerator.init([=](int x, int y) {
       return m_tileArray->tile({x, y}).getCollision();
@@ -1433,6 +1548,10 @@ void WorldServer::init(bool firstTime) {
     m_liquidEngine->setLiquidTickDelta(liquidSettings->id, liquidSettings->tickDelta);
 
   m_fallingBlocksAgent = make_shared<FallingBlocksAgent>(make_shared<FallingBlocksWorld>(this));
+
+  // Dungeon and spawned entity scripts may query wind or weather while the
+  // initial world regions are being generated, so domains must exist first.
+  setupWeatherDomains();
 
   setupForceRegions();
 
@@ -1489,11 +1608,6 @@ void WorldServer::init(bool firstTime) {
       m_playerStart = findPlayerStart(firstTime ? Maybe<Vec2F>() : m_playerStart);
 
     generateRegion(RectI::integral(RectF(m_playerStart, m_playerStart)).padded(m_serverConfig.getInt("playerStartInitialGenRadius")));
-
-    m_weather.setup(m_worldTemplate->weathers(), m_worldTemplate->undergroundLevel(), m_geometry, [this](Vec2I const& pos) {
-        auto const& tile = m_tileArray->tile(pos);
-        return !isRealMaterial(tile.background);
-      });
   } catch (std::exception const& e) {
     m_worldStorage->unloadAll(true);
     throw WorldServerException("Exception encountered initializing world", e);
@@ -1933,12 +2047,25 @@ void WorldServer::queueUpdatePackets(ConnectionId clientId, bool sendRemoteUpdat
   auto const& clientInfo = m_clientInfo.get(clientId);
   clientInfo->outgoingPackets.append(make_shared<StepUpdatePacket>(m_currentTime));
 
-  if (shouldRunThisStep("environmentUpdate")) {
+  Maybe<String> weatherDomain;
+  auto clientWindow = clientInfo->clientState.window();
+  if (clientWindow.isEmpty()) {
+    weatherDomain = clientInfo->weatherDomain;
+  } else if (auto layer = m_worldTemplate->weatherLayerAt(Vec2I::floor(clientInfo->clientState.windowCenter()))) {
+    weatherDomain = layer->domain;
+  }
+  bool weatherDomainChanged = weatherDomain != clientInfo->weatherDomain;
+  if (weatherDomainChanged) {
+    clientInfo->weatherDomain = weatherDomain;
+    clientInfo->weatherNetVersion = 0;
+  }
+
+  if (shouldRunThisStep("environmentUpdate") || weatherDomainChanged) {
     ByteArray skyDelta;
     tie(skyDelta, clientInfo->skyNetVersion) = m_sky->writeUpdate(clientInfo->skyNetVersion, clientInfo->clientState.netCompatibilityRules());
 
     ByteArray weatherDelta;
-    tie(weatherDelta, clientInfo->weatherNetVersion) = m_weather.writeUpdate(clientInfo->weatherNetVersion, clientInfo->clientState.netCompatibilityRules());
+    tie(weatherDelta, clientInfo->weatherNetVersion) = weatherForDomain(clientInfo->weatherDomain)->writeUpdate(clientInfo->weatherNetVersion, clientInfo->clientState.netCompatibilityRules());
 
     if (!skyDelta.empty() || !weatherDelta.empty())
       clientInfo->outgoingPackets.append(make_shared<EnvironmentUpdatePacket>(std::move(skyDelta), std::move(weatherDelta)));
@@ -2238,7 +2365,7 @@ void WorldServer::removeEntity(EntityId entityId, bool andDie) {
 }
 
 float WorldServer::windLevel(Vec2F const& pos) const {
-  return WorldImpl::windLevel(m_tileArray, pos, m_weather.wind());
+  return WorldImpl::windLevel(m_tileArray, pos, weatherAt(pos)->wind());
 }
 
 float WorldServer::lightLevel(Vec2F const& pos) const {
@@ -2273,21 +2400,24 @@ StringList WorldServer::environmentStatusEffects(Vec2F const& pos) const {
 }
 
 StringList WorldServer::weatherStatusEffects(Vec2F const& pos) const {
-  if (!m_weather.statusEffects().empty()) {
+  auto weather = weatherAt(pos);
+  if (!weather->statusEffects().empty()) {
      if (exposedToWeather(pos))
-      return m_weather.statusEffects();
+      return weather->statusEffects();
   }
 
   return {};
 }
 
 bool WorldServer::exposedToWeather(Vec2F const& pos) const {
-  if (!isUnderground(pos) && liquidLevel(Vec2I::floor(pos)).liquid == EmptyLiquidId) {
+  auto layer = m_worldTemplate->weatherLayerAt(Vec2I::floor(pos));
+  auto domain = layer && layer->domain ? m_worldTemplate->weatherDomain(*layer->domain) : nullptr;
+  if (domain && pos[1] > domain->effectsMinHeight && liquidLevel(Vec2I::floor(pos)).liquid == EmptyLiquidId) {
     auto assets = Root::singleton().assets();
     float weatherRayCheckDistance = assets->json("/weather.config:weatherRayCheckDistance").toFloat();
     float weatherRayCheckWindInfluence = assets->json("/weather.config:weatherRayCheckWindInfluence").toFloat();
 
-    auto offset = Vec2F(-m_weather.wind() * weatherRayCheckWindInfluence, weatherRayCheckDistance).normalized() * weatherRayCheckDistance;
+    auto offset = Vec2F(-weatherAt(pos)->wind() * weatherRayCheckWindInfluence, weatherRayCheckDistance).normalized() * weatherRayCheckDistance;
 
     return !lineCollision({pos, pos + offset});
   }
@@ -2387,9 +2517,12 @@ RpcPromise<Json> WorldServer::sendEntityMessage(Variant<EntityId, String> const&
   if (!entity) {
     return RpcPromise<Json>::createFailed("Unknown entity");
   } else if (entity->isMaster()) {
-    if (auto resp = entity->receiveMessage(ServerConnectionId, message, args))
-      return RpcPromise<Json>::createFulfilled(resp.take());
-    else
+    if (auto resp = entity->receiveMessage(ServerConnectionId, message, args)) {
+      if (resp->is<Json>())
+        return RpcPromise<Json>::createFulfilled(resp->get<Json>());
+      else
+        return resp->get<RpcPromise<Json>>();
+    } else
       return RpcPromise<Json>::createFailed("Message not handled by entity");
   } else {
     auto pair = RpcPromise<Json>::createPair();
@@ -2543,7 +2676,7 @@ bool WorldServer::isVisibleToPlayer(RectF const& region) const {
 }
 
 WorldServer::ClientInfo::ClientInfo(ConnectionId clientId, InterpolationTracker const trackerInit)
-  : clientId(clientId), skyNetVersion(0), weatherNetVersion(0), pendingForward(false), started(false), local(false), admin(false), interpolationTracker(trackerInit) {}
+  : clientId(clientId), subWorldId(MainClientWorldId), skyNetVersion(0), weatherNetVersion(0), pendingForward(false), started(false), local(false), admin(false), interpolationTracker(trackerInit) {}
 
 List<RectI> WorldServer::ClientInfo::monitoringRegions(EntityMapPtr const& entityMap) const {
   return clientState.monitoringRegions([entityMap](EntityId entityId) -> Maybe<RectI> {
@@ -2637,11 +2770,12 @@ void WorldServer::setTemplate(WorldTemplatePtr newTemplate) {
     bool local = info->local;
     bool isAdmin = info->admin;
     auto netRules = info->clientState.netCompatibilityRules();
+    auto subWorldId = info->subWorldId;
     SpawnTarget spawnTarget;
     if (auto player = clientPlayer(client))
       spawnTarget = SpawnTargetPosition(player->position() + player->feetOffset());
     removeClient(client);
-    addClient(client, spawnTarget, local, isAdmin, netRules);
+    addClient(client, spawnTarget, local, isAdmin, netRules, subWorldId);
   }
 }
 

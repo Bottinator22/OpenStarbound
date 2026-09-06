@@ -164,6 +164,13 @@ LuaCallbacks LuaBindings::makePlayerCallbacks(Player* player) {
 
   callbacks.registerCallback(   "interactRadius", [player]()         { return player->interactRadius();       });
   callbacks.registerCallback("setInteractRadius", [player](float radius) { player->setInteractRadius(radius); });
+  
+  callbacks.registerCallback("setRenderLayer", [player](Maybe<String> const& layer) { 
+    if (layer)
+      player->setRenderLayer(parseRenderLayer(*layer)); 
+    else
+      player->setRenderLayer({});
+  });
 
   callbacks.registerCallback("actionBarGroup", [player]() {
     return luaTupleReturn(player->inventory()->customBarGroup() + 1, player->inventory()->customBarGroups());
@@ -825,11 +832,11 @@ LuaCallbacks LuaBindings::makePlayerCallbacks(Player* player) {
     player->setCameraFocusEntity(entityId);
   });
 
-  callbacks.registerCallback("headRotation", [player](Maybe<EntityId> const& entityId) {
+  callbacks.registerCallback("headRotation", [player]() {
     return player->getSecretProperty("humanoid.headRotation");
   });
   // more accurate than mcontroller.facingDirection
-  callbacks.registerCallback("facingDirection", [player](Maybe<EntityId> const& entityId) {
+  callbacks.registerCallback("facingDirection", [player]() {
     return numericalDirection(player->humanoid()->facingDirection());
   });
 

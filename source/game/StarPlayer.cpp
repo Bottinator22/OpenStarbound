@@ -40,6 +40,7 @@
 #include "StarScriptedAnimatorLuaBindings.hpp"
 #include "StarEntityLuaBindings.hpp"
 #include "StarDanceDatabase.hpp"
+#include "StarUniverseClient.hpp"
 
 namespace Star {
 
@@ -369,6 +370,7 @@ void Player::init(World* world, EntityId entityId, EntityMode mode) {
     for (auto& p : m_genericScriptContexts) {
       p.second->addActorMovementCallbacks(m_movementController.get());
       p.second->addCallbacks("player", LuaBindings::makePlayerCallbacks(this));
+      p.second->addCallbacks("entity", LuaBindings::makeEntityCallbacks(this));
       p.second->addCallbacks("status", LuaBindings::makeStatusControllerCallbacks(m_statusController.get()));
       p.second->addCallbacks("songbook", LuaBindings::makeSongbookCallbacks(m_songbook.get()));
       p.second->addCallbacks("animator", LuaBindings::makeNetworkedAnimatorCallbacks(humanoid()->networkedAnimator()));
@@ -817,7 +819,7 @@ void Player::dropItem() {
   }
 }
 
-Maybe<Json> Player::receiveMessage(ConnectionId fromConnection, String const& message, JsonArray const& args) {
+Maybe<ChainableJsonMessageResponse> Player::receiveMessage(ConnectionId fromConnection, String const& message, JsonArray const& args) {
   bool localMessage = fromConnection == world()->connection();
   if (message == "queueRadioMessage" && args.size() > 0) {
     float delay = 0;
@@ -864,7 +866,7 @@ Maybe<Json> Player::receiveMessage(ConnectionId fromConnection, String const& me
     if (Root::singleton().collectionDatabase()->hasCollectable(collection, collectable))
       addCollectable(collection, collectable);
   } else {
-    Maybe<Json> result = m_tools->receiveMessage(message, localMessage, args);
+    Maybe<ChainableJsonMessageResponse> result = m_tools->receiveMessage(message, localMessage, args);
     if (!result)
       result = m_statusController->receiveMessage(message, localMessage, args);
     if (!result)
@@ -1242,7 +1244,14 @@ void Player::render(RenderCallback* renderCallback) {
   }
 
   auto loungeAnchor = as<LoungeAnchor>(m_movementController->entityAnchor());
-  EntityRenderLayer renderLayer = loungeAnchor ? loungeAnchor->loungeRenderLayer : RenderLayerPlayer;
+  
+  EntityRenderLayer renderLayer = RenderLayerPlayer;
+  if (auto overrideRenderLayer = getSecretProperty("overrideRenderLayer"); overrideRenderLayer.canConvert(Json::Type::Int)) {
+    renderLayer = overrideRenderLayer.toUInt();
+  }
+  if (loungeAnchor) {
+    renderLayer = loungeAnchor->loungeRenderLayer;
+  }
 
   renderCallback->addDrawables(drawables(), renderLayer);
   if (!isTeleporting())
@@ -1261,6 +1270,10 @@ void Player::render(RenderCallback* renderCallback) {
 void Player::renderLightSources(RenderCallback* renderCallback) {
   renderCallback->addLightSources(lightSources());
   m_deployment->renderLightSources(renderCallback);
+}
+
+void Player::setRenderLayer(Maybe<EntityRenderLayer> layer) {
+  setSecretProperty("overrideRenderLayer", layer ? Json(*layer) : Json());
 }
 
 Json Player::getGenericProperty(String const& name, Json const& defaultValue) const {

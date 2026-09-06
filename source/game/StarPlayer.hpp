@@ -201,13 +201,15 @@ public:
   Direction walkingDirection() const override;
   Direction facingDirection() const override;
 
-  Maybe<Json> receiveMessage(ConnectionId sendingConnection, String const& message, JsonArray const& args = {}) override;
+  Maybe<ChainableJsonMessageResponse> receiveMessage(ConnectionId sendingConnection, String const& message, JsonArray const& args = {}) override;
 
   void update(float dt, uint64_t currentStep) override;
 
   void render(RenderCallback* renderCallback) override;
 
   void renderLightSources(RenderCallback* renderCallback) override;
+  
+  void setRenderLayer(Maybe<EntityRenderLayer> layer);
 
   Json getGenericProperty(String const& name, Json const& defaultValue = Json()) const;
   void setGenericProperty(String const& name, Json const& value);

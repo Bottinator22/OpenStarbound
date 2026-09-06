@@ -869,6 +869,44 @@ static void funcargs (LexState *ls, expdesc *f, int line) {
 */
 
 
+static void safe_navigation(LexState *ls, expdesc *v) {
+    FuncState *fs = ls->fs;
+    luaX_next(ls);
+    luaK_exp2nextreg(fs, v);
+    luaK_codeABC(fs,OP_TEST, v->u.info, NO_REG, 0 );
+    {
+    int old_free=fs->freereg;             
+    int vreg=v->u.info;
+    int j = luaK_codeAsBx(fs, OP_JMP, 0, NO_JUMP);
+    expdesc key;
+    switch(ls->t.token) {
+    case '[':
+        yindex(ls, &key);
+        luaK_indexed(fs, v, &key);
+        luaK_exp2nextreg(fs, v);
+        break;        
+    case '.':
+        luaX_next(ls);
+        checkname(ls, &key);
+        luaK_indexed(fs, v, &key);
+        break;
+    default:
+         luaX_syntaxerror(ls, "unexpected symbol");
+    }
+    luaK_exp2nextreg(fs, v);
+    fs->freereg=old_free;
+    /* i think this check is unnecessary, as any complex key
+      expressions should be courteous enough to leave the top of
+      the stack where they found it. */
+    if(v->u.info!=vreg) {
+        luaK_codeABC(fs,OP_MOVE, vreg, v->u.info, 0 );
+        v->u.info=vreg;
+    }
+    SETARG_sBx(fs->f->code[j], fs->pc-j-1);
+    }
+}
+
+
 static void primaryexp (LexState *ls, expdesc *v) {
   /* primaryexp -> NAME | '(' expr ')' */
   switch (ls->t.token) {
@@ -899,6 +937,10 @@ static void suffixedexp (LexState *ls, expdesc *v) {
   primaryexp(ls, v);
   for (;;) {
     switch (ls->t.token) {
+      case '?': {  /* safe navigation */
+        safe_navigation(ls, v);
+        break;
+      }
       case '.': {  /* fieldsel */
         fieldsel(ls, v);
         break;
@@ -1172,6 +1214,60 @@ static void assignment (LexState *ls, struct LHS_assign *lh, int nvars) {
   }
   init_exp(&e, VNONRELOC, ls->fs->freereg-1);  /* default assignment */
   luaK_storevar(ls->fs, &lh->v, &e);
+}
+
+
+static void compound_assign_op (LexState *ls, expdesc *v) {
+  int line;
+  BinOpr op = OPR_NOBINOPR;
+  FuncState *fs = ls->fs;
+  expdesc e = *v, v2;
+  switch (ls->t.token) {
+    case TK_SCPLUS:
+      op = OPR_ADD;
+      break;
+    case TK_SCMINUS:
+      op = OPR_SUB;
+      break;
+    case TK_SCMULTIPLY:
+      op = OPR_MUL;
+      break;
+    case TK_SCMODULATE:
+      op = OPR_MOD;
+      break;
+    case TK_SCDIVIDE:
+      op = OPR_DIV;
+      break;
+    case TK_SCFLOORDIVIDE:
+      op = OPR_IDIV;
+      break;
+    case TK_SCCONCAT:
+      op = OPR_CONCAT;
+      break;
+    case TK_SCBITLEFTSHIFT:
+      op = OPR_SHL;
+      break;
+    case TK_SCBITRIGHTSHIFT:
+      op = OPR_SHR;
+      break;
+    case TK_SCBITAND:
+      op = OPR_BAND;
+      break;
+    case TK_SCBITOR:
+      op = OPR_BOR;
+      break;
+  }
+  luaK_reserveregs(fs,fs->freereg-fs->nactvar); /* reserve all registers needed by the lvalue */
+  luaX_next(ls);
+  line = ls->linenumber;
+  enterlevel(ls);
+  luaK_infix(fs,op,&e);
+  expr(ls, &v2);
+  luaK_posfix(fs, op, &e, &v2, line);
+  leavelevel(ls);
+  luaK_exp2nextreg(fs, &e);
+  luaK_setoneret(ls->fs, &e);
+  luaK_storevar(ls->fs, v, &e);
 }
 
 
@@ -1494,6 +1590,10 @@ static void exprstat (LexState *ls) {
   if (ls->t.token == '=' || ls->t.token == ',') { /* stat -> assignment ? */
     v.prev = NULL;
     assignment(ls, &v, 1);
+  }
+  else if (ls->t.token >= TK_SCPLUS && ls->t.token <= TK_SCBITOR) { /* compound op token range */
+    v.prev = NULL;
+    compound_assign_op(ls, &v.v);
   }
   else {  /* stat -> func */
     check_condition(ls, v.v.k == VCALL, "syntax error");

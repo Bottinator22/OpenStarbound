@@ -29,26 +29,30 @@ An installer is available for Windows. otherwise, extract the client/server zip 
 <details>
 <summary><b>Nightly Builds</b></summary>
  
-These link directly to the latest build from the [Actions](https://github.com/OpenStarbound/OpenStarbound/actions?query=branch%3Amain) tab.
+These link directly to the latest build from the [Actions](https://github.com/OpenStarbound/OpenStarbound/actions?query=branch%3Amain) tab, main branch.
  
 **Windows**
 [Installer](https://nightly.link/OpenStarbound/OpenStarbound/workflows/build/main/OpenStarbound-Windows-Installer.zip),
 [Client](https://nightly.link/OpenStarbound/OpenStarbound/workflows/build/main/OpenStarbound-Windows-Client.zip),
 [Server](https://nightly.link/OpenStarbound/OpenStarbound/workflows/build/main/OpenStarbound-Windows-Server.zip)
 
+### **notice: get Linux and macOS builds directly from the [Actions](https://github.com/OpenStarbound/OpenStarbound/actions?query=branch%3Amain) tab until the nightly.link service fixes things**
+
 **Linux**
-[Client](https://nightly.link/OpenStarbound/OpenStarbound/workflows/build/main/OpenStarbound-Linux-Clang-Client.zip),
-[Server](https://nightly.link/OpenStarbound/OpenStarbound/workflows/build/main/OpenStarbound-Linux-Clang-Server.zip)
+~~[Client](https://nightly.link/OpenStarbound/OpenStarbound/workflows/build/main/OpenStarbound-Linux-Clang-Client.tar.lz),~~
+~~[Server](https://nightly.link/OpenStarbound/OpenStarbound/workflows/build/main/OpenStarbound-Linux-Clang-Server.tar.lz)~~
 
 **macOS**
-[Intel](https://nightly.link/OpenStarbound/OpenStarbound/workflows/build/main/OpenStarbound-macOS-Intel-Client.zip),
-[ARM](https://nightly.link/OpenStarbound/OpenStarbound/workflows/build/main/OpenStarbound-macOS-Silicon-Client.zip)
+~~[Intel](https://nightly.link/OpenStarbound/OpenStarbound/workflows/build/main/OpenStarbound-macOS-Intel-Client.tar.lz),~~
+~~[ARM](https://nightly.link/OpenStarbound/OpenStarbound/workflows/build/main/OpenStarbound-macOS-Silicon-Client.tar.lz)~~
+
+---
 
 [All Nightly Builds](https://nightly.link/OpenStarbound/OpenStarbound/workflows/build/main)
 </details>
 
 ## Changes
-Note: Not every function from [StarExtensions](https://github.com/StarExtensions/StarExtensions) has been ported yet, but near-full compatibility with mods that use StarExtensions features is planned.
+Note: Mods that use StarExtensions features often work with OpenStarbound, StarExtensions is deprecated.
 
 ### Lighting
 **The lightmap generation has been moved off the main thread, and supports higher color range.**
@@ -66,6 +70,8 @@ Note: Not every function from [StarExtensions](https://github.com/StarExtensions
     * `/settileprotection`
       * You can now specify as many dungeon IDs as you want: `/settileprotection 69 420 false`
       * You can now specify a range: /settileprotection 0..65535 true
+    * `/admin`
+      * You can now admin other players: `/admin playerSpecifier` (requires OpenSB server)
 ### Bug Fixes
 * Invalid character inventories are updated when loading in, allowing players to swap inventory mods with pre-existing characters.
 * Fix vanilla world file size bloating issue.
@@ -84,6 +90,7 @@ Note: Not every function from [StarExtensions](https://github.com/StarExtensions
 * Musical instruments have their own volume slider in the options menu.
 * Players can use items while lounging
 * Mods can change which scriptPane the Matter Manipulator/Collections sidebar button opens, in [interface.config.patch](https://github.com/OpenStarbound/OpenStarbound/blob/main/assets/opensb/interface.config.patch).
+* Items can change their rarity border. [Documentation](https://github.com/OpenStarbound/OpenStarbound/blob/main/doc/json/openstarbound/items.md)
 
 * Client-side tile placement prediction (rewrite from StarExtensions)
   * You can also resize the placement area of tiles on the fly.

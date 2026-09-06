@@ -14,7 +14,7 @@
 #include "StarLuaComponents.hpp"
 #include "StarWorldRenderData.hpp"
 #include "StarWarping.hpp"
-#include "StarRpcThreadPromise.hpp"
+#include "StarRpcPromise.hpp"
 
 namespace Star {
 
@@ -89,7 +89,7 @@ public:
 
   // Returns false if the client id already exists, or the spawn target is
   // invalid.
-  bool addClient(ConnectionId clientId, SpawnTarget const& spawnTarget, bool isLocal, bool isAdmin = false, NetCompatibilityRules netRules = {});
+  bool addClient(ConnectionId clientId, SpawnTarget const& spawnTarget, bool isLocal, bool isAdmin = false, NetCompatibilityRules netRules = {}, ClientSubWorldId subWorldId = MainClientWorldId);
 
   // Removes client, sends the WorldStopPacket, and returns any pending packets
   // for that client
@@ -101,6 +101,8 @@ public:
   // May return null if a Player is not available or if the client id is not
   // valid.
   PlayerPtr clientPlayer(ConnectionId clientId) const;
+  
+  ClientSubWorldId clientSubWorld(ConnectionId clientId) const;
 
   List<EntityId> players() const;
 
@@ -108,7 +110,7 @@ public:
   List<PacketPtr> getOutgoingPackets(ConnectionId clientId);
   bool sendPacket(ConnectionId clientId, PacketPtr const& packet);
 
-  Maybe<Json> receiveMessage(ConnectionId fromConnection, String const& message, JsonArray const& args);
+  Maybe<ChainableJsonMessageResponse> receiveMessage(ConnectionId fromConnection, String const& message, JsonArray const& args);
 
   void startFlyingSky(bool enterHyperspace, bool startInWarp, Json settings = {});
   void stopFlyingSkyAt(SkyParameters const& destination);
@@ -209,6 +211,8 @@ public:
 
   ScriptComponentPtr scriptContext(String const& contextName);
 
+  List<EntityId> entityIds() const;
+
   // Queues a microdungeon for placement
   RpcPromise<Vec2I> enqueuePlacement(List<BiomeItemDistribution> distributions, Maybe<DungeonId> id);
 
@@ -278,10 +282,11 @@ public:
   void setWeatherIndex(size_t weatherIndex, bool force = false);
   // Force the current weather to a specific weather type by name
   void setWeather(String const& weatherName, bool force = false);
+  void setWeather(Vec2F const& position, String const& weatherName, bool force = false);
 
   // Returns the list of weather names available in this world
   StringList weatherList() const;
-
+  StringList weatherList(Vec2F const& position) const;
 
   // used to notify the universe server that the celestial planet type has changed
   Maybe<pair<String, String>> pullNewPlanetType();
@@ -295,8 +300,10 @@ private:
     bool needsDamageNotification(RemoteDamageNotification const& rdn) const;
 
     ConnectionId clientId;
+    ClientSubWorldId subWorldId;
     uint64_t skyNetVersion;
     uint64_t weatherNetVersion;
+    Maybe<String> weatherDomain;
     WorldClientState clientState;
     bool pendingForward;
     bool started;
@@ -359,6 +366,10 @@ private:
   bool isFloatingDungeonWorld() const;
 
   void setupForceRegions();
+  void setupWeatherDomains(bool preserveNonSurface = false);
+  ServerWeatherPtr weatherForDomain(Maybe<String> const& domain) const;
+  ServerWeatherPtr weatherAt(Vec2F const& position) const;
+  ServerWeatherPtr surfaceWeather() const;
 
   Json m_serverConfig;
 
@@ -394,7 +405,8 @@ private:
   mutable CellularLightIntensityCalculator m_lightIntensityCalculator;
   SkyPtr m_sky;
 
-  ServerWeather m_weather;
+  StringMap<ServerWeatherPtr> m_weatherDomains;
+  ServerWeatherPtr m_emptyWeather;
 
   ClockPtr m_referenceClock;
 
@@ -427,6 +439,7 @@ private:
   bool m_tileProtectionEnabled;
 
   HashMap<Uuid, pair<ConnectionId, MVariant<ConnectionId, RpcPromiseKeeper<Json>>>> m_entityMessageResponses;
+  HashMap<Uuid, pair<ConnectionId, RpcPromise<Json>>> m_entityMessagePromises;
 
   List<PhysicsForceRegion> m_forceRegions;
 

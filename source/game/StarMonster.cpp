@@ -405,8 +405,12 @@ void Monster::destroy(RenderCallback* renderCallback) {
         treasurePool = m_dropPool.getString("default");
     }
 
-    for (auto const& treasureItem : treasureDatabase->createTreasure(treasurePool, *m_monsterLevel))
-      world()->addEntity(ItemDrop::createRandomizedDrop(treasureItem, position()));
+    try {
+      for (auto const& treasureItem : treasureDatabase->createTreasure(treasurePool, *m_monsterLevel))
+        world()->addEntity(ItemDrop::createRandomizedDrop(treasureItem, position()));
+    } catch (StarException const& e) {
+      Logger::warn("Failed to create treasure for monster '{}': {}", m_monsterVariant.type, outputException(e, false));
+    }
   }
 
   if (renderCallback) {
@@ -522,8 +526,8 @@ void Monster::setPosition(Vec2F const& pos) {
   m_movementController->setPosition(pos);
 }
 
-Maybe<Json> Monster::receiveMessage(ConnectionId sendingConnection, String const& message, JsonArray const& args) {
-  Maybe<Json> result = m_scriptComponent.handleMessage(message, world()->connection() == sendingConnection, args);
+Maybe<ChainableJsonMessageResponse> Monster::receiveMessage(ConnectionId sendingConnection, String const& message, JsonArray const& args) {
+  Maybe<ChainableJsonMessageResponse> result = m_scriptComponent.handleMessage(message, world()->connection() == sendingConnection, args);
   if (!result)
     result = m_statusController->receiveMessage(message, world()->connection() == sendingConnection, args);
   return result;
@@ -879,6 +883,5 @@ ActorMovementController* Monster::movementController() {
 StatusController* Monster::statusController() {
   return m_statusController.get();
 }
-
 
 }

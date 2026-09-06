@@ -5,6 +5,8 @@
 #include "StarListener.hpp"
 #include "StarWorld.hpp"
 #include "StarWorldLuaBindings.hpp"
+#include "StarRpcPromise.hpp"
+#include "StarLuaGameConverters.hpp"
 
 namespace Star {
 
@@ -84,6 +86,8 @@ public:
 
   Maybe<LuaContext> const& context() const;
   Maybe<LuaContext>& context();
+  
+  virtual RpcPromise<Json> threadPassMessage(String const& thread, String const& message, JsonArray const& args);
 
 protected:
   virtual void contextSetup();
@@ -94,9 +98,11 @@ protected:
   // Checks the initialization state of the script, while also reloading the
   // script and clearing the error state if a root reload has occurred.
   bool checkInitialization();
-
+  
+  virtual LuaCallbacks makeThreadsCallbacks();
+  
+  void cleanThreads();
 private:
-  LuaCallbacks makeThreadsCallbacks();
   
   StringList m_scripts;
   StringMap<LuaCallbacks> m_callbacks;
@@ -105,8 +111,7 @@ private:
   Maybe<LuaContext> m_context;
   Maybe<String> m_error;
   
-  StringMap<shared_ptr<ScriptableThread>> m_threads;
-  mutable RecursiveMutex m_threadLock;
+  StringMap<ScriptableThreadPtr> m_threads;
 };
 
 // Wraps a basic lua component to add a persistent storage table translated
@@ -129,9 +134,19 @@ private:
 // rate.  Every call to 'update' here will only call the internal script
 // 'update' at the configured delta.  Adds a update tick controls under the
 // 'script' callback table.
+
+// Also allows scriptable threads to send messages back to parent context where they will be handled on update.
+
 template <typename Base>
 class LuaUpdatableComponent : public Base {
 public:
+  struct ThreadMessage {
+    String originThread;
+    String message;
+    JsonArray args;
+    RpcPromiseKeeper<Json> promise;
+  };
+  
   LuaUpdatableComponent();
 
   unsigned updateDelta() const;
@@ -145,10 +160,26 @@ public:
 
   template <typename Ret = LuaValue, typename... V>
   Maybe<Ret> update(V&&... args);
+  
+  RpcPromise<Json> threadPassMessage(String const& thread, String const& message, JsonArray const& args) override;
 
+protected:
+  virtual LuaCallbacks makeThreadsCallbacks() override;
 private:
+  Maybe<ChainableJsonMessageResponse> handleThreadMessage(ThreadMessage const& message);
+  
   Periodic m_updatePeriodic;
   mutable float m_lastDt;
+  
+  List<ThreadMessage> m_threadMessages;
+  mutable RecursiveMutex m_threadMessageMutex;
+  
+  struct ThreadMessageHandler {
+    Maybe<LuaFunction> function;
+    String name;
+  };
+
+  StringMap<ThreadMessageHandler> m_threadMessageHandlers;
 };
 
 // Wraps a basic lua component so that world callbacks are added on init, and
@@ -172,7 +203,7 @@ class LuaMessageHandlingComponent : public Base {
 public:
   LuaMessageHandlingComponent();
 
-  Maybe<Json> handleMessage(String const& message, bool localMessage, JsonArray const& args = {});
+  Maybe<ChainableJsonMessageResponse> handleMessage(String const& message, bool localMessage, JsonArray const& args = {});
 
 protected:
   virtual void contextShutdown() override;
@@ -290,11 +321,71 @@ bool LuaUpdatableComponent<Base>::updateReady() const {
 }
 
 template <typename Base>
-template <typename Ret, typename... V>
-Maybe<Ret> LuaUpdatableComponent<Base>::update(V&&... args) {
-  if (!m_updatePeriodic.tick())
+RpcPromise<Json> LuaUpdatableComponent<Base>::threadPassMessage(String const& thread, String const& message, JsonArray const& args) {
+  auto pair = RpcPromise<Json>::createPair();
+  RecursiveMutexLocker locker(m_threadMessageMutex);
+  m_threadMessages.append({thread,message,args,pair.second});
+  return pair.first;
+}
+
+template <typename Base>
+Maybe<ChainableJsonMessageResponse> LuaUpdatableComponent<Base>::handleThreadMessage(ThreadMessage const& message) {
+  if (!Base::initialized())
     return {};
 
+  if (auto handler = m_threadMessageHandlers.ptr(message.message)) {
+    try {
+      return handler->function->template invoke<ChainableJsonMessageResponse>(message.originThread, message.message, luaUnpack(message.args));
+    } catch (LuaException const& e) {
+      Logger::error(
+          "Exception while invoking lua thread message handler for message '{}'. {}", message.message, outputException(e, true));
+      Base::setError(String(printException(e, false)));
+    }
+  }
+  return {};
+}
+
+template <typename Base>
+LuaCallbacks LuaUpdatableComponent<Base>::makeThreadsCallbacks() {
+  auto callbacks = Base::makeThreadsCallbacks();
+  
+  callbacks.registerCallback("setMessageHandler", [this](String message, Maybe<LuaFunction> handler) {
+    if (handler) {
+      ThreadMessageHandler handlerInfo = {};
+      handlerInfo.name = message;
+      handlerInfo.function.emplace(handler.take());
+      m_threadMessageHandlers.set(handlerInfo.name, handlerInfo);
+    }
+    else
+      m_threadMessageHandlers.remove(message);
+  });
+  
+  return callbacks;
+}
+
+template <typename Base>
+template <typename Ret, typename... V>
+Maybe<Ret> LuaUpdatableComponent<Base>::update(V&&... args) {
+  List<ThreadMessage> messages;
+  {
+    RecursiveMutexLocker locker(m_threadMessageMutex);
+    messages = std::move(m_threadMessages);
+  }
+  for (auto& message : messages) {
+    if (auto resp = handleThreadMessage(message))
+      if (resp->template is<RpcPromise<Json>>())
+        message.promise.chain(resp->template get<RpcPromise<Json>>());
+      else
+        message.promise.fulfill(resp->template get<Json>());
+    else
+      message.promise.fail("Message not handled");
+  }
+  
+  if (!m_updatePeriodic.tick())
+    return {};
+  
+  Base::cleanThreads();
+  
   return Base::template invoke<Ret>("update", std::forward<V>(args)...);
 }
 
@@ -342,7 +433,7 @@ LuaMessageHandlingComponent<Base>::LuaMessageHandlingComponent() {
 }
 
 template <typename Base>
-Maybe<Json> LuaMessageHandlingComponent<Base>::handleMessage(
+Maybe<ChainableJsonMessageResponse> LuaMessageHandlingComponent<Base>::handleMessage(
     String const& message, bool localMessage, JsonArray const& args) {
   if (!Base::initialized())
     return {};
@@ -353,14 +444,14 @@ Maybe<Json> LuaMessageHandlingComponent<Base>::handleMessage(
         if (!localMessage)
           return {};
         else if (handler->passName)
-          return handler->function->template invoke<Json>(message, luaUnpack(args));
+          return handler->function->template invoke<ChainableJsonMessageResponse>(message, luaUnpack(args));
         else
-          return handler->function->template invoke<Json>(luaUnpack(args));
+          return handler->function->template invoke<ChainableJsonMessageResponse>(luaUnpack(args));
       }
       else if (handler->passName)
-        return handler->function->template invoke<Json>(message, localMessage, luaUnpack(args));
+        return handler->function->template invoke<ChainableJsonMessageResponse>(message, localMessage, luaUnpack(args));
       else
-        return handler->function->template invoke<Json>(localMessage, luaUnpack(args));
+        return handler->function->template invoke<ChainableJsonMessageResponse>(localMessage, luaUnpack(args));
     } catch (LuaException const& e) {
       Logger::error(
           "Exception while invoking lua message handler for message '{}'. {}", message, outputException(e, true));

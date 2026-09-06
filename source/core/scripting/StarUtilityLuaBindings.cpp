@@ -8,6 +8,7 @@
 #include "StarInterpolation.hpp"
 #include "StarLuaConverters.hpp"
 #include "StarText.hpp"
+#include "StarTime.hpp"
 
 namespace Star {
 
@@ -169,6 +170,17 @@ LuaCallbacks LuaBindings::makeUtilityCallbacks() {
         if (max < min)
           throw LuaException("Maximum bound in staticRandomDoubleRange must be >= minimum bound!");
         return (hash64LuaValues(hashValues) & 0x7fffffffffffffff) / 9223372036854775808.0 * (max - min) + min;
+      });
+  
+  callbacks.registerCallback("millisecondsSinceEpoch",
+      []() -> int64_t {
+        return Time::millisecondsSinceEpoch();
+      });
+  
+  callbacks.registerCallback("makePromise",
+      []() -> pair<RpcPromise<Json>,AutoFailRpcPromiseKeeperPtr<Json>> {
+        auto pair = RpcPromise<Json>::createPair();
+        return make_pair(pair.first,make_shared<AutoFailRpcPromiseKeeper<Json>>(pair.second));
       });
 
   return callbacks;

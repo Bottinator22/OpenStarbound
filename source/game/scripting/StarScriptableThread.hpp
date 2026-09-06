@@ -3,7 +3,7 @@
 #include "StarThread.hpp"
 #include "StarLuaRoot.hpp"
 #include "StarLuaComponents.hpp"
-#include "StarRpcThreadPromise.hpp"
+#include "StarRpcPromise.hpp"
 
 namespace Star {
 
@@ -17,13 +17,13 @@ public:
   struct Message {
     String message;
     JsonArray args;
-    RpcThreadPromiseKeeper<Json> promise;
+    RpcPromiseKeeper<Json> promise;
   };
 
   typedef LuaMessageHandlingComponent<LuaUpdatableComponent<LuaBaseComponent>> ScriptComponent;
   typedef shared_ptr<ScriptComponent> ScriptComponentPtr;
 
-  ScriptableThread(Json parameters);
+  ScriptableThread(Json parameters, LuaBaseComponent* parent);
   ~ScriptableThread();
 
   void start();
@@ -44,7 +44,7 @@ protected:
 
 private:
   void update();
-  Maybe<Json> receiveMessage(String const& message, JsonArray const& args);
+  Maybe<ChainableJsonMessageResponse> receiveMessage(String const& message, JsonArray const& args);
 
   mutable RecursiveMutex m_mutex;
   
@@ -53,6 +53,8 @@ private:
   
   Json m_parameters;
   String m_name;
+  // log mapping can be disabled on scriptable threads to reduce debug clutter
+  bool m_logMapped;
   
   float m_timestep;
 
@@ -63,6 +65,8 @@ private:
   atomic<bool> m_pause;
   mutable atomic<bool> m_errorOccurred;
   mutable atomic<bool> m_shouldExpire;
+  
+  LuaBaseComponent* m_parent;
   
   LuaCallbacks makeThreadCallbacks();
   Json configValue(String const& name, Json def) const;

@@ -42,9 +42,13 @@ float BiomeDatabase::biomeHueShift(String const& biomeName, uint64_t seed) const
   return pickHueShiftFromJson(config.parameters.get("hueShiftOptions", {}), seed, "BiomeHueShift");
 }
 
+bool BiomeDatabase::biomeHasWeather(String const& biomeName) const {
+  return m_biomes.get(biomeName).parameters.contains("weather");
+}
+
 WeatherPool BiomeDatabase::biomeWeathers(String const& biomeName, uint64_t seed, float threatLevel) const {
   WeatherPool weatherPool;
-  if (auto weatherList = binnedChoiceFromJson(m_biomes.get(biomeName).parameters.get("weather", JsonArray{}), threatLevel).optArray()) {
+  if (auto weatherList = binnedChoiceFromJson(m_biomes.get(biomeName).parameters.get("weather", JsonArray{}), threatLevel).optArray(); weatherList && !weatherList->empty()) {
     auto weatherPoolPath = staticRandomFrom(*weatherList, seed, "WeatherPool");
 
     auto assets = Root::singleton().assets();

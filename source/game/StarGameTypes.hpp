@@ -3,10 +3,15 @@
 #include "StarString.hpp"
 #include "StarBiMap.hpp"
 #include "StarVector.hpp"
+#include "StarJson.hpp"
+#include "StarRpcPromise.hpp"
 #include "StarLiquidTypes.hpp"
 #include "StarMaterialTypes.hpp"
 
 namespace Star {
+
+typedef Variant<String,RpcPromise<String>> ServerCommandResult;
+typedef Variant<Json,RpcPromise<Json>> ChainableJsonMessageResponse;
 
 enum class Direction : uint8_t {
   Left,
@@ -116,7 +121,26 @@ typedef uint16_t ConnectionId;
 ConnectionId const ServerConnectionId = 0;
 // Minimum and maximum valid client ids
 ConnectionId const MinClientConnectionId = 1;
-ConnectionId const MaxClientConnectionId = 32767;
+ConnectionId const MaxClientConnectionId = 16383;
+ConnectionId const MinClientSubWorldConnectionId = MaxClientConnectionId+1;
+ConnectionId const MaxClientSubWorldConnectionId = MaxClientConnectionId-MinClientConnectionId+MinClientSubWorldConnectionId;
+
+inline ConnectionId mainToSubWorldConnectionId(ConnectionId const& id) {
+  return id-MinClientConnectionId+MinClientSubWorldConnectionId;
+}
+inline ConnectionId maybeMainToSubWorldConnectionId(ConnectionId const& id) {
+  return id >= MinClientSubWorldConnectionId ? id-MinClientConnectionId+MinClientSubWorldConnectionId : id;
+}
+inline ConnectionId subWorldToMainConnectionId(ConnectionId const& id) {
+  return id-MinClientSubWorldConnectionId+MinClientConnectionId;
+}
+
+// for client sub-world threads. indexes by *world* rather than by thread.
+// this should allow the client to possibly split the subworlds to multiple threads in the future.
+typedef uint16_t ClientSubWorldId;
+ConnectionId const MainClientWorldId = 0;
+ConnectionId const MinClientSubWorldId = 1;
+ConnectionId const MaxClientSubWorldId = highest<ClientSubWorldId>();
 
 template <typename Vec2T>
 inline Vec2F centerOfTile(Vec2T const& tile) {

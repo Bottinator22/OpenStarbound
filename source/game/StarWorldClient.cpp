@@ -1,4 +1,5 @@
 #include "StarWorldClient.hpp"
+#include "StarAssets.hpp"
 #include "StarIterator.hpp"
 #include "StarLogging.hpp"
 #include "StarBiome.hpp"
@@ -29,10 +30,16 @@ const std::string SECRET_BROADCAST_PREFIX = "\0Broadcast\0"s;
 
 const float WorldClient::DropDist = 6.0f;
 WorldClient::WorldClient(PlayerPtr mainPlayer, LuaRootPtr luaRoot) {
+  // main client world, set up to render
   auto& root = Root::singleton();
   auto assets = root.assets();
 
   m_clientConfig = assets->json("/client.config");
+  
+  m_expiryTimer = GameTimer(0);
+  
+  m_headless = false;
+  m_subWorldId = MainClientWorldId;
 
   m_currentStep = 0;
   m_currentTime = 0;
@@ -95,6 +102,46 @@ WorldClient::WorldClient(PlayerPtr mainPlayer, LuaRootPtr luaRoot) {
   clearWorld();
 }
 
+WorldClient::WorldClient(ClientSubWorldId subWorldId) {
+  // client subworld, doesn't render
+  auto& root = Root::singleton();
+  auto assets = root.assets();
+
+  m_clientConfig = assets->json("/client.config");
+  
+  m_expiryTimer = GameTimer(m_clientConfig.getFloat("idleSubWorldExpireTime"));
+  
+  m_headless = true;
+
+  m_currentStep = 0;
+  m_currentTime = 0;
+
+  m_inWorld = false;
+  m_subWorldId = subWorldId;
+
+  m_luaRoot = make_shared<LuaRoot>();
+  m_luaRoot->luaEngine().setNullTerminated(false);
+  m_luaRoot->tuneAutoGarbageCollection(m_clientConfig.getFloat("luaGcPause"), m_clientConfig.getFloat("luaGcStepMultiplier"));
+
+  m_collisionGenerator.init([this](int x, int y) {
+    if (!m_predictedTiles.empty()) {
+      if (auto p = m_predictedTiles.ptr({x, y})) {
+        if (p->collision)
+          return *p->collision;
+      }
+    }
+    return m_tileArray->tile({x, y}).collision;
+  });
+
+  m_modifiedTilePredictionTimeout = (int)round(m_clientConfig.getFloat("modifiedTilePredictionTimeout") / GlobalTimestep);
+
+  m_latency = 0.0;
+
+  m_damageNotificationBatchDuration = m_clientConfig.getFloat("damageNotificationBatchDuration");
+
+  clearWorld();
+}
+
 WorldClient::~WorldClient() {
   if (m_lightingThread) {
     m_stopLightingThread = true;
@@ -112,6 +159,14 @@ bool WorldClient::inWorld() const {
   return m_inWorld;
 }
 
+bool WorldClient::isHeadless() const {
+  return m_headless;
+}
+
+ClientSubWorldId WorldClient::subWorldId() const {
+  return m_subWorldId;
+}
+
 bool WorldClient::inSpace() const {
   if (!m_sky)
     return false;
@@ -125,14 +180,14 @@ bool WorldClient::flying() const {
 }
 
 bool WorldClient::mainPlayerDead() const {
-  if (inWorld())
+  if (inWorld() && !m_headless)
     return !m_entityMap->get<Player>(m_mainPlayer->entityId());
   else
     return false;
 }
 
 void WorldClient::reviveMainPlayer() {
-  if (inWorld() && mainPlayerDead()) {
+  if (inWorld() && !m_headless && mainPlayerDead()) {
     m_mainPlayer->revive(m_playerStart);
     m_mainPlayer->init(this, m_entityMap->reserveEntityId(), EntityMode::Master);
     m_entityMap->addEntity(m_mainPlayer);
@@ -438,6 +493,10 @@ float WorldClient::windLevel(Vec2F const& pos) const {
   if (!inWorld())
     return 0.0f;
 
+  auto layer = m_worldTemplate->weatherLayerAt(Vec2I::floor(pos));
+  if (!layer || layer->domain != m_weatherDomain)
+    return WorldImpl::windLevel(m_tileArray, pos, 0.0f);
+
   return WorldImpl::windLevel(m_tileArray, pos, m_weather.wind());
 }
 
@@ -462,6 +521,9 @@ WorldClientState& WorldClient::clientState() {
 }
 
 void WorldClient::render(WorldRenderData& renderData, unsigned bufferTiles) {
+  if (m_headless)
+    return;
+  
   if (!m_lightingThread && m_asyncLighting)
     m_lightingThread = Thread::invoke("WorldClient::lightingMain", mem_fn(&WorldClient::lightingMain), this);
 
@@ -633,7 +695,7 @@ void WorldClient::render(WorldRenderData& renderData, unsigned bufferTiles) {
     });
 
   for (auto& pair : m_predictedTiles) {
-    Vec2I tileArrayPos = m_geometry.diff(pair.first, renderData.tileMinPosition);
+    Vec2I tileArrayPos(m_geometry.pdiff(pair.first[0], renderData.tileMinPosition[0]), pair.first[1] - renderData.tileMinPosition[1]);
     if (tileArrayPos[0] >= 0 && tileArrayPos[0] < (int)renderData.tiles.size(0) && tileArrayPos[1] >= 0 && tileArrayPos[1] < (int)renderData.tiles.size(1)) {
       RenderTile& renderTile = renderData.tiles(tileArrayPos[0], tileArrayPos[1]);
       PredictedTile& p = pair.second;
@@ -654,7 +716,7 @@ void WorldClient::render(WorldRenderData& renderData, unsigned bufferTiles) {
   }
 
   for (auto const& previewTile : m_previewTiles) {
-    Vec2I tileArrayPos = m_geometry.diff(previewTile.position, renderData.tileMinPosition);
+    Vec2I tileArrayPos(m_geometry.pdiff(previewTile.position[0], renderData.tileMinPosition[0]), previewTile.position[1] - renderData.tileMinPosition[1]);
     if (tileArrayPos[0] >= 0 && tileArrayPos[0] < (int)renderData.tiles.size(0) && tileArrayPos[1] >= 0 && tileArrayPos[1] < (int)renderData.tiles.size(1)) {
       RenderTile& renderTile = renderData.tiles(tileArrayPos[0], tileArrayPos[1]);
 
@@ -714,8 +776,65 @@ void WorldClient::render(WorldRenderData& renderData, unsigned bufferTiles) {
     }
   }
 
+  auto weatherParallaxAsset = currentWeatherDomain() == m_weatherDomain ? m_weather.weatherParallax() : Maybe<String>();
+  if (weatherParallaxAsset != m_weatherParallaxAsset || environmentBiome != m_weatherParallaxBiome) {
+    m_weatherParallaxAsset = weatherParallaxAsset;
+    m_weatherParallaxBiome = environmentBiome;
+    m_weatherParallax.reset();
+
+    if (weatherParallaxAsset && Root::singleton().assets()->assetExists(*weatherParallaxAsset)) {
+      if (environmentBiome && environmentBiome->parallax) {
+        m_weatherParallax = environmentBiome->parallax->createOverlay(*weatherParallaxAsset);
+      } else {
+        float hueShift = environmentBiome ? environmentBiome->hueShift : 0.0f;
+        Maybe<TreeVariant> treeVariant;
+        if (environmentBiome)
+          treeVariant = environmentBiome->surfacePlaceables.firstTreeType();
+
+        m_weatherParallax = make_shared<Parallax>(*weatherParallaxAsset,
+            m_worldTemplate->worldSeed(), m_worldTemplate->surfaceLevel(), hueShift, std::move(treeVariant));
+      }
+      m_weatherParallax->fadeToSkyColor(m_sky->mainSkyColor());
+    }
+  }
+
+  if (m_weatherParallax) {
+    for (auto layer : m_weatherParallax->layers()) {
+      layer.alpha *= m_weather.weatherIntensity();
+      renderData.parallaxLayers.append(std::move(layer));
+    }
+  }
+
+  double parallaxEpoch = m_sky->epochTime();
+  float parallaxWind = currentWeatherDomain() == m_weatherDomain ? m_weather.wind() : 0.0f;
+  if (m_lastParallaxWindEpoch && parallaxEpoch >= *m_lastParallaxWindEpoch) {
+    double elapsed = parallaxEpoch - *m_lastParallaxWindEpoch;
+    m_parallaxWindDirectionTime += elapsed * (parallaxWind > 0.0f ? 1.0 : -1.0);
+    m_parallaxWindMagnitudeTime += elapsed * std::abs(parallaxWind);
+    m_parallaxSignedWindTime += elapsed * parallaxWind;
+  }
+  m_lastParallaxWindEpoch = parallaxEpoch;
+
   auto functionDatabase = Root::singleton().functionDatabase();
   for (auto& layer : renderData.parallaxLayers) {
+    if (layer.followsWind || layer.windSpeedMultiplier) {
+      double windTime;
+      float horizontalSpeed = layer.speed[0];
+      if (layer.followsWind) {
+        // Parallax texture offsets move the image opposite the offset sign,
+        // so negate the magnitude to make positive wind move imagery right.
+        horizontalSpeed = -std::abs(horizontalSpeed);
+        windTime = layer.windSpeedMultiplier
+            ? m_parallaxSignedWindTime * *layer.windSpeedMultiplier
+            : m_parallaxWindDirectionTime;
+      } else {
+        windTime = m_parallaxWindMagnitudeTime * *layer.windSpeedMultiplier;
+      }
+
+      layer.parallaxOffset[0] += horizontalSpeed * windTime / m_sky->dayLength();
+      layer.speed[0] = 0.0f;
+    }
+
     if (!layer.timeOfDayCorrelation.empty())
       layer.alpha *= clamp((float)functionDatabase->function(layer.timeOfDayCorrelation)->evaluate(m_sky->timeOfDay() / m_sky->dayLength()), 0.0f, 1.0f);
   }
@@ -951,12 +1070,14 @@ void WorldClient::handleIncomingPackets(List<PacketPtr> const& packets) {
             m_predictedTiles.erase(findPrediction);
         }
 
-        if (auto placeMaterial = modification.second.ptr<PlaceMaterial>()) {
-          auto stack = materialDatabase->materialItemDrop(placeMaterial->material);
-          tryGiveMainPlayerItem(itemDatabase->item(stack), true);
-        } else if (auto placeMod = modification.second.ptr<PlaceMod>()) {
-          auto stack = materialDatabase->modItemDrop(placeMod->mod);
-          tryGiveMainPlayerItem(itemDatabase->item(stack), true);
+        if (!m_headless) {
+          if (auto placeMaterial = modification.second.ptr<PlaceMaterial>()) {
+            auto stack = materialDatabase->materialItemDrop(placeMaterial->material);
+            tryGiveMainPlayerItem(itemDatabase->item(stack), true);
+          } else if (auto placeMod = modification.second.ptr<PlaceMod>()) {
+            auto stack = materialDatabase->modItemDrop(placeMod->mod);
+            tryGiveMainPlayerItem(itemDatabase->item(stack), true);
+          }
         }
       }
 
@@ -966,13 +1087,22 @@ void WorldClient::handleIncomingPackets(List<PacketPtr> const& packets) {
         tile->liquid = liquidUpdate->liquidUpdate.liquidLevel();
 
     } else if (auto giveItem = as<GiveItemPacket>(packet)) {
-      tryGiveMainPlayerItem(itemDatabase->item(giveItem->item));
+      if (m_headless) {
+        // TODO: call something on world script
+      } else {
+        tryGiveMainPlayerItem(itemDatabase->item(giveItem->item));
+      }
 
     } else if (auto stepUpdate = as<StepUpdatePacket>(packet)) {
       m_interpolationTracker.receiveTimeUpdate(stepUpdate->remoteTime);
 
     } else if (auto environmentUpdatePacket = as<EnvironmentUpdatePacket>(packet)) {
       m_sky->readUpdate(environmentUpdatePacket->skyDelta, m_clientState.netCompatibilityRules());
+      auto weatherDomain = currentWeatherDomain();
+      if (weatherDomain != m_weatherDomain) {
+        m_weather.clear();
+        m_weatherDomain = take(weatherDomain);
+      }
       m_weather.readUpdate(environmentUpdatePacket->weatherDelta, m_clientState.netCompatibilityRules());
 
     } else if (auto hit = as<HitRequestPacket>(packet)) {
@@ -1048,10 +1178,14 @@ void WorldClient::handleIncomingPackets(List<PacketPtr> const& packets) {
         if (fromConnection == *m_clientId) // Kae: The server should not be able to forge entity messages that appear as if they're from us
           fromConnection = ServerConnectionId;
 
-        auto response = entity->receiveMessage(entityMessagePacket->fromConnection, entityMessagePacket->message, entityMessagePacket->args);
-        if (response)
-          m_outgoingPackets.append(make_shared<EntityMessageResponsePacket>(makeRight(response.take()), entityMessagePacket->uuid));
-        else
+        if (auto response = entity->receiveMessage(entityMessagePacket->fromConnection, entityMessagePacket->message, entityMessagePacket->args)) {
+          if (response->is<Json>()) {
+            m_outgoingPackets.append(make_shared<EntityMessageResponsePacket>(makeRight(response->get<Json>()), entityMessagePacket->uuid));
+          } else {
+            // delay the response until this promise is done
+            m_entityMessagePromises[entityMessagePacket->uuid] = response->get<RpcPromise<Json>>();
+          } 
+        } else
           m_outgoingPackets.append(make_shared<EntityMessageResponsePacket>(makeLeft("Message not handled by entity"), entityMessagePacket->uuid));
       }
 
@@ -1134,7 +1268,31 @@ List<PacketPtr> WorldClient::getOutgoingPackets() {
   return std::move(m_outgoingPackets);
 }
 
+Maybe<ChainableJsonMessageResponse> WorldClient::receiveMessage(ConnectionId fromConnection, String const& message, JsonArray const& args) {
+  m_expiryTimer.reset();
+  if (!inWorld()) {
+    // script contexts aren't active to handle this message
+    return {};
+  }
+  Maybe<ChainableJsonMessageResponse> result;
+  for (auto& p : m_scriptContexts) {
+    result = p.second->handleMessage(message, fromConnection == ServerConnectionId, args);
+    if (result)
+      break;
+  }
+  return result;
+}
+
+WorldClient::ScriptComponentPtr WorldClient::scriptContext(String const& contextName) {
+  if (auto context = m_scriptContexts.ptr(contextName))
+    return *context;
+  else
+    return nullptr;
+}
+
 void WorldClient::update(float dt) {
+  m_expiryTimer.tick(dt);
+  
   if (!inWorld())
     return;
 
@@ -1156,13 +1314,15 @@ void WorldClient::update(float dt) {
     }
   });
 
-  // Secret broadcasts are transmitted through DamageNotifications for vanilla server compatibility.
-  // Because DamageNotification packets are spoofable, we have to sign the data so other clients can validate that it is legitimate.
-  auto& publicKey = Curve25519::publicKey();
-  String publicKeyString((const char*)publicKey.data(), publicKey.size());
-  m_mainPlayer->setSecretProperty(SECRET_BROADCAST_PUBLIC_KEY, publicKeyString);
-  // Temporary: Backwards compatibility with StarExtensions
-  m_mainPlayer->effectsAnimator()->setGlobalTag("\0SE_VOICE_SIGNING_KEY"s, publicKeyString);
+  if (!m_headless) {
+    // Secret broadcasts are transmitted through DamageNotifications for vanilla server compatibility.
+    // Because DamageNotification packets are spoofable, we have to sign the data so other clients can validate that it is legitimate.
+    auto& publicKey = Curve25519::publicKey();
+    String publicKeyString((const char*)publicKey.data(), publicKey.size());
+    m_mainPlayer->setSecretProperty(SECRET_BROADCAST_PUBLIC_KEY, publicKeyString);
+    // Temporary: Backwards compatibility with StarExtensions
+    m_mainPlayer->effectsAnimator()->setGlobalTag("\0SE_VOICE_SIGNING_KEY"s, publicKeyString);
+  }
 
   ++m_currentStep;
   m_currentTime += dt;
@@ -1206,93 +1366,143 @@ void WorldClient::update(float dt) {
     }, [](EntityPtr const& a, EntityPtr const& b) {
       return a->entityType() < b->entityType();
     });
+  
+  if (m_headless) {
+    if (m_entityMap->size() > 0) {
+      m_expiryTimer.reset();
+    } else if (m_expiryTimer.ready()) {
+      // world has had no entities and isn't being used, destroy it
+      requestDestroy();
+    }
+  }
 
-  m_clientState.setPlayer(m_mainPlayer->entityId());
+  RectI particleRegion;
+  if (!m_headless) {
+    m_clientState.setPlayer(m_mainPlayer->entityId());
+    
+    m_sky->setAltitude(m_clientState.windowCenter()[1]);
+    
+    auto clientWindow = m_clientState.window();
+    particleRegion = clientWindow.padded(m_clientConfig.getInt("particleRegionPadding"));
+    // Weather generation is layer-scoped, but the particle manager also owns
+    // particles from entities, materials, and effects and must retain the full
+    // client region.
+    RectI weatherParticleRegion = particleRegion;
+
+    Maybe<String> weatherDomain = m_weatherDomain;
+    if (clientWindow.isEmpty()) {
+      weatherParticleRegion = {};
+    } else if (auto layer = m_worldTemplate->weatherLayerAt(Vec2I::floor(m_clientState.windowCenter()))) {
+      weatherDomain = layer->domain;
+      weatherParticleRegion = RectI(weatherParticleRegion.xMin(), std::max(weatherParticleRegion.yMin(), layer->minHeight),
+          weatherParticleRegion.xMax(), std::min(weatherParticleRegion.yMax(), layer->maxHeight));
+    } else {
+      weatherParticleRegion = {};
+    }
+
+    if (weatherDomain != m_weatherDomain)
+      weatherParticleRegion = {};
+
+    m_weather.setVisibleRegion(weatherParticleRegion);
+  }
+  
   m_clientState.setClientPresenceEntities(std::move(clientPresenceEntities));
+
+  for (auto& pair : m_scriptContexts)
+    pair.second->update(pair.second->updateDt(dt));
 
   m_damageManager->update(dt);
   handleDamageNotifications();
 
-  m_sky->setAltitude(m_clientState.windowCenter()[1]);
   m_sky->update(dt);
 
-  RectI particleRegion = m_clientState.window().padded(m_clientConfig.getInt("particleRegionPadding"));
-
-  m_weather.setVisibleRegion(particleRegion);
   m_weather.update(dt);
 
-  if (!m_mainPlayer->isDead()) {
-    // Clear m_requestedDrops every so often in case of entity id reuse or
-    // desyncs etc
-    if (m_currentStep % m_clientConfig.getInt("itemRequestReset") == 0)
+  if (!m_headless) {
+    if (!m_mainPlayer->isDead()) {
+      // Clear m_requestedDrops every so often in case of entity id reuse or
+      // desyncs etc
+      if (m_currentStep % m_clientConfig.getInt("itemRequestReset") == 0)
+        m_requestedDrops.clear();
+
+      Vec2F playerPos = m_mainPlayer->position();
+      auto dropList = m_entityMap->query<ItemDrop>(RectF(playerPos - Vec2F::filled(DropDist / 2), playerPos + Vec2F::filled(DropDist / 2)));
+      for (auto itemDrop : dropList) {
+        auto distSquared = m_geometry.diff(itemDrop->position(), playerPos).magnitudeSquared();
+
+        // If the drop is within DropDist and not owned, request it.
+        if (itemDrop->canTake() && !m_requestedDrops.contains(itemDrop->entityId()) && distSquared < square(DropDist)) {
+          m_requestedDrops.add(itemDrop->entityId());
+          if (m_mainPlayer->itemsCanHold(itemDrop->item()) != 0) {
+            m_startupHiddenEntities.erase(itemDrop->entityId());
+            itemDrop->takeBy(m_mainPlayer->entityId(), (float)m_latency / 1000);
+            m_outgoingPackets.append(make_shared<RequestDropPacket>(itemDrop->entityId()));
+          }
+        }
+      }
+    } else {
       m_requestedDrops.clear();
+    }
 
-    Vec2F playerPos = m_mainPlayer->position();
-    auto dropList = m_entityMap->query<ItemDrop>(RectF(playerPos - Vec2F::filled(DropDist / 2), playerPos + Vec2F::filled(DropDist / 2)));
-    for (auto itemDrop : dropList) {
-      auto distSquared = m_geometry.diff(itemDrop->position(), playerPos).magnitudeSquared();
+    sparkDamagedBlocks();
 
-      // If the drop is within DropDist and not owned, request it.
-      if (itemDrop->canTake() && !m_requestedDrops.contains(itemDrop->entityId()) && distSquared < square(DropDist)) {
-        m_requestedDrops.add(itemDrop->entityId());
-        if (m_mainPlayer->itemsCanHold(itemDrop->item()) != 0) {
-          m_startupHiddenEntities.erase(itemDrop->entityId());
-          itemDrop->takeBy(m_mainPlayer->entityId(), (float)m_latency / 1000);
-          m_outgoingPackets.append(make_shared<RequestDropPacket>(itemDrop->entityId()));
+    m_particles->addParticles(m_weather.pullNewParticles());
+    m_particles->update(dt, RectF(particleRegion), m_weather.wind());
+
+    if (auto audioSample = m_ambientSounds.updateAmbient(currentAmbientNoises(), m_sky->isDayTime()))
+      m_samples.append(audioSample);
+    if (auto audioSample = m_ambientSounds.updateWeather(currentWeatherNoises()))
+      m_samples.append(audioSample);
+
+    if (inSpace()) {
+      m_samples.appendAll(m_sky->pullSounds());
+
+      if (m_spaceSound && m_spaceSound->finished()) {
+        m_spaceSound = {};
+        m_activeSpaceSound = "";
+      }
+
+      auto skyAmbientNoise = m_sky->ambientNoise();
+      if (skyAmbientNoise != m_activeSpaceSound) {
+        if (m_spaceSound) {
+          m_spaceSound->stop(skyAmbientNoise == "" ? 3.0 : 0.0);
+        } else {
+          m_activeSpaceSound = skyAmbientNoise;
+          if (!m_activeSpaceSound.empty()) {
+            m_spaceSound = make_shared<AudioInstance>(*assets->audio(m_activeSpaceSound));
+            m_samples.append(m_spaceSound);
+          }
         }
       }
     }
-  } else {
-    m_requestedDrops.clear();
-  }
 
-  sparkDamagedBlocks();
-
-  m_particles->addParticles(m_weather.pullNewParticles());
-  m_particles->update(dt, RectF(particleRegion), m_weather.wind());
-
-  if (auto audioSample = m_ambientSounds.updateAmbient(currentAmbientNoises(), m_sky->isDayTime()))
-    m_samples.append(audioSample);
-  if (auto audioSample = m_ambientSounds.updateWeather(currentWeatherNoises()))
-    m_samples.append(audioSample);
-
-  if (inSpace()) {
-    m_samples.appendAll(m_sky->pullSounds());
-
-    if (m_spaceSound && m_spaceSound->finished()) {
-      m_spaceSound = {};
-      m_activeSpaceSound = "";
+    if (auto newAltMusic = m_mainPlayer->pullPendingAltMusic()) {
+      if (newAltMusic->first)
+        playAltMusic(newAltMusic->first->first, newAltMusic->second, newAltMusic->first->second);
+      else
+        stopAltMusic(newAltMusic->second);
     }
 
-    auto skyAmbientNoise = m_sky->ambientNoise();
-    if (skyAmbientNoise != m_activeSpaceSound) {
-      if (m_spaceSound) {
-        m_spaceSound->stop(skyAmbientNoise == "" ? 3.0 : 0.0);
-      } else {
-        m_activeSpaceSound = skyAmbientNoise;
-        if (!m_activeSpaceSound.empty()) {
-          m_spaceSound = make_shared<AudioInstance>(*assets->audio(m_activeSpaceSound));
-          m_samples.append(m_spaceSound);
-        }
-      }
-    }
+    if (auto audioSample = m_altMusicTrack.updateAmbient(currentAltMusicTrack(), true))
+      m_music.append(audioSample);
+
+    if (auto audioSample = m_musicTrack.updateAmbient(currentMusicTrack(), m_sky->isDayTime()))
+      m_music.append(audioSample);
   }
-
-  if (auto newAltMusic = m_mainPlayer->pullPendingAltMusic()) {
-    if (newAltMusic->first)
-      playAltMusic(newAltMusic->first->first, newAltMusic->second, newAltMusic->first->second);
-    else
-      stopAltMusic(newAltMusic->second);
-  }
-
-  if (auto audioSample = m_altMusicTrack.updateAmbient(currentAltMusicTrack(), true))
-    m_music.append(audioSample);
-
-  if (auto audioSample = m_musicTrack.updateAmbient(currentMusicTrack(), m_sky->isDayTime()))
-    m_music.append(audioSample);
 
   for (EntityId entityId : toRemove)
     removeEntity(entityId, true);
+  
+  for (auto const& uuid : m_entityMessagePromises.keys()) {
+    if (m_entityMessagePromises[uuid].finished()) {
+      if (m_entityMessagePromises[uuid].succeeded()) {
+        m_outgoingPackets.append(make_shared<EntityMessageResponsePacket>(makeRight(*m_entityMessagePromises[uuid].result()), uuid));
+      } else {
+        m_outgoingPackets.append(make_shared<EntityMessageResponsePacket>(makeLeft(*m_entityMessagePromises[uuid].error()), uuid));
+      }
+      m_entityMessagePromises.remove(uuid);
+    }
+  }
 
   queueUpdatePackets(m_entityUpdateTimer.wrapTick(dt));
 
@@ -1301,7 +1511,7 @@ void WorldClient::update(float dt) {
     m_outgoingPackets.append(make_shared<PingPacket>(*m_pingTime));
   }
 
-  LogMap::set("client_ping", m_latency);
+  LogMap::set(strf("client_{}_ping",m_subWorldId), m_latency);
 
   // Remove active sectors that are outside of the current monitoring region
   Set<ClientTileSectorArray::Sector> neededSectors;
@@ -1322,9 +1532,9 @@ void WorldClient::update(float dt) {
   if (m_collisionDebug)
     renderCollisionDebug();
 
-  LogMap::set("client_entities", m_entityMap->size());
-  LogMap::set("client_sectors", toString(loadedSectors.size()));
-  LogMap::set("client_lua_mem", m_luaRoot->luaMemoryUsage());
+  LogMap::set(strf("client_{}_entities",m_subWorldId), m_entityMap->size());
+  LogMap::set(strf("client_{}_sectors",m_subWorldId), toString(loadedSectors.size()));
+  LogMap::set(strf("client_{}_lua_mem",m_subWorldId), m_luaRoot->luaMemoryUsage());
 }
 
 ConnectionId WorldClient::connection() const {
@@ -1476,7 +1686,7 @@ bool WorldClient::waitForLighting(WorldRenderData* renderData) {
   if (renderData && !m_lightMap.empty()) {
     for (auto& previewTile : m_previewTiles) {
       if (previewTile.updateLight) {
-        Vec2I lightArrayPos = m_geometry.diff(previewTile.position, m_lightMinPosition);
+        Vec2I lightArrayPos(m_geometry.pdiff(previewTile.position[0], m_lightMinPosition[0]), previewTile.position[1] - m_lightMinPosition[1]);
         if (lightArrayPos[0] >= 0 && lightArrayPos[0] < (int)m_lightMap.width()
          && lightArrayPos[1] >= 0 && lightArrayPos[1] < (int)m_lightMap.height())
           m_lightMap.set(lightArrayPos[0], lightArrayPos[1], Color::v3bToFloat(previewTile.light));
@@ -1566,7 +1776,13 @@ void WorldClient::handleDamageNotifications() {
       return false;
     });
 
+  if (m_headless) {
+    m_damageManager->pullPendingNotifications();
+    return;
+  }
+  
   for (auto const& damageNotification : m_damageManager->pullPendingNotifications()) {
+    
     auto damageDatabase = Root::singleton().damageDatabase();
     DamageKind const& damageKind = damageDatabase->damageKind(damageNotification.damageSourceKind);
     ElementalType const& elementalType = damageDatabase->elementalType(damageKind.elementalType);
@@ -1749,8 +1965,15 @@ void WorldClient::lightingCalc() {
 
   prepLocker.unlock();
 
+  Vec2I regionMin = m_lightingCalculator.calculationRegion().min();
+  auto resolvePosition = [&](Vec2F const& pos) -> Vec2F {
+    float xFloor = floor(pos[0]);
+    float xOffset = (float)m_geometry.pdiff((int)xFloor, regionMin[0]) + (pos[0] - xFloor);
+    return Vec2F(regionMin[0] + xOffset, pos[1]);
+  };
+
   for (auto const& light : lights) {
-    Vec2F position = m_geometry.nearestTo(Vec2F(m_lightingCalculator.calculationRegion().min()), light.position);
+    Vec2F position = resolvePosition(light.position);
     if (light.type == LightType::Spread)
       m_lightingCalculator.addSpreadLight(position, light.color);
     else {
@@ -1768,7 +1991,7 @@ void WorldClient::lightingCalc() {
   }
 
   for (auto const& lightPair : particleLights) {
-    Vec2F position = m_geometry.nearestTo(Vec2F(m_lightingCalculator.calculationRegion().min()), lightPair.first);
+    Vec2F position = resolvePosition(lightPair.first);
     m_lightingCalculator.addSpreadLight(position, lightPair.second);
   }
 
@@ -1806,7 +2029,8 @@ void WorldClient::initWorld(WorldStartPacket const& startPacket) {
   m_entityUpdateTimer = GameTimer(m_interpolationTracker.entityUpdateDelta());
 
   m_clientId = startPacket.clientId;
-  m_mainPlayer->clientContext()->setConnectionId(startPacket.clientId);
+  if (!m_headless)
+    m_mainPlayer->clientContext()->setConnectionId(startPacket.clientId);
   auto entitySpace = connectionEntitySpace(startPacket.clientId);
   m_worldTemplate = make_shared<WorldTemplate>(startPacket.templateData);
   m_entityMap = make_shared<EntityMap>(m_worldTemplate->size(), entitySpace.first, entitySpace.second);
@@ -1850,6 +2074,8 @@ void WorldClient::initWorld(WorldStartPacket const& startPacket) {
       auto const& tile = m_tileArray->tile(pos);
       return !isRealMaterial(tile.background) && !isSolidColliding(tile.getCollision());
     });
+  if (auto layer = m_worldTemplate->weatherLayerAt(Vec2I::floor(startPacket.playerStart)))
+    m_weatherDomain = layer->domain;
   m_weather.readUpdate(startPacket.weatherData, m_clientState.netCompatibilityRules());
 
   m_lightingCalculator.setMonochrome(Root::singleton().configuration()->get("monochromeLighting").toBool());
@@ -1858,28 +2084,60 @@ void WorldClient::initWorld(WorldStartPacket const& startPacket) {
 
   m_inWorld = true;
   
-  if (!m_mainPlayer->isDead()) {
-    m_mainPlayer->init(this, m_entityMap->reserveEntityId(), EntityMode::Master);
-    m_entityMap->addEntity(m_mainPlayer);
-  }
-  m_mainPlayer->moveTo(startPacket.playerStart);
-  if (const auto& parameters = m_worldTemplate->worldParameters())
-    m_mainPlayer->overrideTech(parameters->overrideTech);
-  else
-    m_mainPlayer->overrideTech({});
+  if (!m_headless) {
+    if (!m_mainPlayer->isDead()) {
+      m_mainPlayer->init(this, m_entityMap->reserveEntityId(), EntityMode::Master);
+      m_entityMap->addEntity(m_mainPlayer);
+    }
+    m_mainPlayer->moveTo(startPacket.playerStart);
+    if (const auto& parameters = m_worldTemplate->worldParameters())
+      m_mainPlayer->overrideTech(parameters->overrideTech);
+    else
+      m_mainPlayer->overrideTech({});
 
-  // Auto reposition the client window on the player when the main player
-  // changes position.
-  centerClientWindowOnPlayer();
+    // Auto reposition the client window on the player when the main player
+    // changes position.
+    centerClientWindowOnPlayer();
+  }
+  
+  // script contexts for both kinds of worlds
+  for (auto& p : m_clientConfig.getObject("worldScriptContexts")) {
+    auto scriptComponent = make_shared<ScriptComponent>();
+    scriptComponent->setScripts(jsonToStringList(p.second.toArray()));
+
+    m_scriptContexts.set(p.first, scriptComponent);
+    scriptComponent->init(this);
+  }
+  
+  for (auto& p : m_clientConfig.getObject(m_headless ? "subWorldScriptContexts" : "mainWorldScriptContexts")) {
+    if (m_scriptContexts.contains(p.first)) {
+      Logger::error("World script context {} is already defined!", p.first);
+      continue;
+    }
+    
+    auto scriptComponent = make_shared<ScriptComponent>();
+    scriptComponent->setScripts(jsonToStringList(p.second.toArray()));
+
+    m_scriptContexts.set(p.first, scriptComponent);
+    scriptComponent->init(this);
+  }
 }
 
 void WorldClient::clearWorld() {
+  for (auto& p : m_scriptContexts)
+    p.second->invoke("preUninit");
+  
   if (m_entityMap) {
     while (m_entityMap->size() > 0) {
       for (auto entityId : m_entityMap->entityIds())
         removeEntity(entityId, false);
     }
   }
+  
+  for (auto& p : m_scriptContexts)
+    p.second->uninit();
+
+  m_scriptContexts.clear();
 
   waitForLighting();
 
@@ -1909,6 +2167,15 @@ void WorldClient::clearWorld() {
 
   m_currentParallax.reset();
   m_nextParallax.reset();
+  m_weatherParallaxAsset.reset();
+  m_weatherParallaxBiome.reset();
+  m_weatherParallax.reset();
+  m_weatherDomain.reset();
+  m_lastParallaxWindEpoch.reset();
+  m_parallaxWindDirectionTime = 0.0;
+  m_parallaxWindMagnitudeTime = 0.0;
+  m_parallaxSignedWindTime = 0.0;
+  m_weather.clear();
   m_parallaxFadeTimer.setDone();
 
   m_clientState.reset();
@@ -1925,8 +2192,13 @@ void WorldClient::clearWorld() {
   }
 
   m_entityMessageResponses = {};
+  m_findUniqueEntityResponses = {};
+  m_entityMessagePromises = {};
 
   m_forceRegions.clear();
+  
+  m_expiryTimer.reset();
+  m_requestedDestroy = false;
 }
 
 void WorldClient::tryGiveMainPlayerItem(ItemPtr item, bool silent) {
@@ -1945,12 +2217,28 @@ void WorldClient::notifyEntityCreate(EntityPtr const& entity) {
   }
 }
 
+List<EntityId> WorldClient::entityIds() const {
+  return m_entityMap->entityIds();
+}
+
 Vec2I WorldClient::environmentBiomeTrackPosition() const {
   if (!inWorld())
     return {};
 
   auto pos = Vec2I::floor(m_clientState.windowCenter());
   return {m_geometry.xwrap(pos[0]), pos[1]};
+}
+
+Maybe<String> WorldClient::currentWeatherDomain() const {
+  if (!m_worldTemplate)
+    return {};
+
+  auto window = m_clientState.window();
+  if (window.isEmpty())
+    return m_weatherDomain;
+  if (auto layer = m_worldTemplate->weatherLayerAt(Vec2I::floor(m_clientState.windowCenter())))
+    return layer->domain;
+  return {};
 }
 
 AmbientNoisesDescriptionPtr WorldClient::currentAmbientNoises() const {
@@ -1963,6 +2251,9 @@ AmbientNoisesDescriptionPtr WorldClient::currentAmbientNoises() const {
 
 WeatherNoisesDescriptionPtr WorldClient::currentWeatherNoises() const {
   if (!inWorld())
+    return {};
+
+  if (currentWeatherDomain() != m_weatherDomain)
     return {};
 
   auto trackOptions = m_weather.weatherTrackOptions();
@@ -2161,7 +2452,10 @@ bool WorldClient::exposedToWeather(Vec2F const& pos) const {
   if (!inWorld())
     return false;
 
-  if (!isUnderground(pos) && liquidLevel(Vec2I::floor(pos)).liquid == EmptyLiquidId) {
+  auto layer = m_worldTemplate->weatherLayerAt(Vec2I::floor(pos));
+  auto domain = layer && layer->domain ? m_worldTemplate->weatherDomain(*layer->domain) : nullptr;
+  if (domain && layer->domain == m_weatherDomain && pos[1] > domain->effectsMinHeight
+      && liquidLevel(Vec2I::floor(pos)).liquid == EmptyLiquidId) {
     auto assets = Root::singleton().assets();
     float weatherRayCheckDistance = assets->json("/weather.config:weatherRayCheckDistance").toFloat();
     float weatherRayCheckWindInfluence = assets->json("/weather.config:weatherRayCheckWindInfluence").toFloat();
@@ -2310,6 +2604,17 @@ LuaRootPtr WorldClient::luaRoot() {
   return m_luaRoot;
 }
 
+bool WorldClient::pullRequestedDestroy() {
+  auto out = m_requestedDestroy;
+  m_requestedDestroy = false;
+  return out;
+}
+
+void WorldClient::requestDestroy() {
+  m_expiryTimer.reset();
+  m_requestedDestroy = true;
+}
+
 RpcPromise<Vec2F> WorldClient::findUniqueEntity(String const& uniqueId) {
   if (!inWorld())
     return RpcPromise<Vec2F>::createFailed("Not currently in a world");
@@ -2341,9 +2646,12 @@ RpcPromise<Json> WorldClient::sendEntityMessage(Variant<EntityId, String> const&
   if (entityId.is<EntityId>() && !entity && m_clientId == connectionForEntity(entityId.get<EntityId>())) {
     return RpcPromise<Json>::createFailed("Unknown entity");
   } else if (entity && entity->isMaster()) {
-    if (auto resp = entity->receiveMessage(*m_clientId, message, args))
-      return RpcPromise<Json>::createFulfilled(resp.take());
-    else
+    if (auto resp = entity->receiveMessage(*m_clientId, message, args)) {
+      if (resp->is<Json>())
+        return RpcPromise<Json>::createFulfilled(resp->get<Json>());
+      else
+        return resp->get<RpcPromise<Json>>();
+    } else
       return RpcPromise<Json>::createFailed("Message not handled by entity");
   } else {
     auto pair = RpcPromise<Json>::createPair();
@@ -2500,6 +2808,14 @@ void WorldClient::setupForceRegions() {
     bottomForceRegion.categoryFilter = regionCategoryFilter;
     m_forceRegions.append(bottomForceRegion);
   }
+}
+
+bool WorldClient::shouldExpire() {
+  if (inWorld()) {
+    return false;
+  }
+
+  return m_expiryTimer.ready();
 }
 
 }

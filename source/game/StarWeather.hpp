@@ -98,6 +98,8 @@ public:
 
   void readUpdate(ByteArray data, NetCompatibilityRules rules);
 
+  void clear();
+
   void setVisibleRegion(RectI visibleRegion);
 
   void update(double dt);
@@ -109,6 +111,7 @@ public:
 
   List<Particle> pullNewParticles();
   StringList weatherTrackOptions() const;
+  Maybe<String> weatherParallax() const;
 
 private:
   void getNetStates();

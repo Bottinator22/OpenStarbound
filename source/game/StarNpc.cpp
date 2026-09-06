@@ -383,9 +383,13 @@ void Npc::destroy(RenderCallback* renderCallback) {
 
   if (isMaster() && !m_dropPools.get().empty()) {
     auto treasureDatabase = Root::singleton().treasureDatabase();
-    for (auto const& treasureItem :
-        treasureDatabase->createTreasure(staticRandomFrom(m_dropPools.get(), m_npcVariant.seed), m_npcVariant.level))
-      world()->addEntity(ItemDrop::createRandomizedDrop(treasureItem, position()));
+    try {
+      for (auto const& treasureItem :
+          treasureDatabase->createTreasure(staticRandomFrom(m_dropPools.get(), m_npcVariant.seed), m_npcVariant.level))
+        world()->addEntity(ItemDrop::createRandomizedDrop(treasureItem, position()));
+    } catch (StarException const& e) {
+      Logger::warn("Failed to create treasure for NPC '{}': {}", npcType(), outputException(e, false));
+    }
   }
 
   if (renderCallback && m_deathParticleBurst.get())
@@ -1129,8 +1133,8 @@ List<LightSource> Npc::lightSources() const {
   return lights;
 }
 
-Maybe<Json> Npc::receiveMessage(ConnectionId sendingConnection, String const& message, JsonArray const& args) {
-  Maybe<Json> result = m_scriptComponent.handleMessage(message, world()->connection() == sendingConnection, args);
+Maybe<ChainableJsonMessageResponse> Npc::receiveMessage(ConnectionId sendingConnection, String const& message, JsonArray const& args) {
+  Maybe<ChainableJsonMessageResponse> result = m_scriptComponent.handleMessage(message, world()->connection() == sendingConnection, args);
   if (!result)
     result = m_statusController->receiveMessage(message, world()->connection() == sendingConnection, args);
   return result;

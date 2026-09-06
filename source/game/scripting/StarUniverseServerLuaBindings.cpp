@@ -21,13 +21,52 @@ LuaCallbacks LuaBindings::makeUniverseServerCallbacks(UniverseServer* universe) 
   callbacks.registerCallbackWithSignature<void, ConnectionId, bool>("setPvp", bind(UniverseServerCallbacks::setPvp, universe, _1, _2));
   callbacks.registerCallbackWithSignature<bool, String>("isWorldActive", bind(UniverseServerCallbacks::isWorldActive, universe, _1));
   callbacks.registerCallbackWithSignature<StringList>("activeWorlds", bind(UniverseServerCallbacks::activeWorlds, universe));
-  callbacks.registerCallbackWithSignature<RpcThreadPromise<Json>, String, String, LuaVariadic<Json>>("sendWorldMessage", bind(UniverseServerCallbacks::sendWorldMessage, universe, _1, _2, _3));
+  callbacks.registerCallbackWithSignature<RpcPromise<Json>, String, String, LuaVariadic<Json>>("sendWorldMessage", bind(UniverseServerCallbacks::sendWorldMessage, universe, _1, _2, _3));
   callbacks.registerCallbackWithSignature<bool, ConnectionId, String, Json>("sendPacket", bind(UniverseServerCallbacks::sendPacket, universe, _1, _2, _3));
   callbacks.registerCallbackWithSignature<String, ConnectionId>("clientWorld", bind(UniverseServerCallbacks::clientWorld, universe, _1));
   callbacks.registerCallbackWithSignature<void, ConnectionId, Maybe<String>>("disconnectClient", bind(UniverseServerCallbacks::disconnectClient, universe, _1, _2));
   callbacks.registerCallbackWithSignature<void, ConnectionId, Maybe<String>, bool, bool, Maybe<int>>("banClient", bind(UniverseServerCallbacks::banClient, universe, _1, _2, _3, _4, _5));
   callbacks.registerCallback("warpClient", [universe](ConnectionId clientId, String action, Maybe<bool> deploy) {
     universe->clientWarpPlayer(clientId, parseWarpAction(action), deploy.value(false));
+  });
+  
+  callbacks.registerCallback("clientOpenProtocolVersion", [universe](ConnectionId clientId) {
+    return universe->clientConnectionVersion(clientId);
+  });
+  
+  callbacks.registerCallback("createCustomWorld", [universe](String name, Json templateData) {
+    universe->createCustomWorld(CustomWorldId(name), make_shared<WorldTemplate>(templateData));
+  });
+  callbacks.registerCallback("createCustomWorldFromConfig", [universe](String name, Json worldConfig) {
+    uint64_t worldSeed;
+    if (worldConfig.contains("seed"))
+      worldSeed = worldConfig.getUInt("seed");
+    else
+      worldSeed = Random::randu64();
+
+    String worldType = worldConfig.getString("type");
+
+    VisitableWorldParametersPtr worldParameters;
+    if (worldType.equalsIgnoreCase("Terrestrial"))
+      worldParameters = generateTerrestrialWorldParameters(worldConfig.getString("planetType"), worldConfig.getString("planetSize"), worldSeed);
+    else if (worldType.equalsIgnoreCase("Asteroids"))
+      worldParameters = generateAsteroidsWorldParameters(worldSeed);
+    else if (worldType.equalsIgnoreCase("FloatingDungeon"))
+      worldParameters = generateFloatingDungeonWorldParameters(worldConfig.getString("dungeonWorld"));
+    else
+      throw StarException(strf("Unknown world type: '{}'\n", worldType));
+
+    if (worldConfig.contains("level"))
+      worldParameters->threatLevel = worldConfig.getFloat("level");
+
+    if (worldConfig.contains("beamUpRule"))
+      worldParameters->beamUpRule = BeamUpRuleNames.getLeft(worldConfig.getString("beamUpRule"));
+    worldParameters->disableDeathDrops = worldConfig.getBool("disableDeathDrops", false);
+
+    SkyParameters skyParameters = SkyParameters(worldConfig.get("skyParameters", Json()));
+    auto worldTemplate = make_shared<WorldTemplate>(worldParameters, skyParameters, worldSeed);
+    Json worldProperties = worldConfig.get("worldProperties", JsonObject{});
+    universe->createCustomWorld(CustomWorldId(name), worldTemplate);
   });
 
   return callbacks;
@@ -133,7 +172,7 @@ StringList LuaBindings::UniverseServerCallbacks::activeWorlds(UniverseServer* un
   return universe->activeWorlds().transformed(printWorldId);
 }
 
-RpcThreadPromise<Json> LuaBindings::UniverseServerCallbacks::sendWorldMessage(UniverseServer* universe, String const& worldId, String const& message, LuaVariadic<Json> args) {
+RpcPromise<Json> LuaBindings::UniverseServerCallbacks::sendWorldMessage(UniverseServer* universe, String const& worldId, String const& message, LuaVariadic<Json> args) {
   return universe->sendWorldMessage(parseWorldId(worldId), message, JsonArray::from(std::move(args)));
 }
 
