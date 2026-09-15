@@ -15,6 +15,72 @@ void throwInvalidUtf32CodePoint(Utf32Type val) {
   throw UnicodeException::format("Invalid UTF-32 code point {} encountered while trying to encode UTF-8", (int32_t)val);
 }
 
+
+bool isValidUtf8(const Utf8Type* utf8, size_t remain) {
+  bool stopOnNull = remain == NPos;
+
+  while (true) {
+    if (remain == 0)
+      break;
+
+    if (stopOnNull && utf8[0] == 0)
+      break;
+
+    if ((utf8[0] & 0x80) == 0x00) {
+      ++utf8;
+      --remain;
+      continue;
+    }
+
+    if (remain == 1) {
+      // 1 invalid character with missing end
+      return false;
+    }
+
+    if ((utf8[0] & 0xe0) == 0xc0 && (utf8[1] & 0xc0) == 0x80) {
+      if (((utf8[0] & 0x1fL) << 6) >= 0x00000080L) {
+        utf8 += 2;
+        remain -= 2;
+        continue;
+      } else {
+        return false;
+      }
+    }
+
+    if (remain == 2) {
+      return false;
+    }
+
+    if ((utf8[0] & 0xf0) == 0xe0 && (utf8[1] & 0xc0) == 0x80 && (utf8[2] & 0xc0) == 0x80) {
+      if ((((utf8[0] & 0x0fL) << 12) | ((utf8[1] & 0x3fL) << 6)) >= 0x00000800L) {
+        utf8 += 3;
+        remain -= 3;
+        continue;
+      } else {
+        return false;
+      }
+    }
+
+    if (remain == 3) {
+      return false;
+    }
+
+    if ((utf8[0] & 0xf8) == 0xf0 && (utf8[1] & 0xc0) == 0x80 && (utf8[2] & 0xc0) == 0x80 && (utf8[3] & 0xc0) == 0x80) {
+      if ((((utf8[0] & 0x07L) << 18) | ((utf8[1] & 0x3fL) << 12)) >= 0x00010000L) {
+        utf8 += 4;
+        remain -= 4;
+        continue;
+      } else {
+        return false;
+      }
+    } else {
+      return false;
+    }
+  }
+
+  return true;
+}
+
 size_t utf8Length(const Utf8Type* utf8, size_t remain) {
   bool stopOnNull = remain == NPos;
   size_t length = 0;
@@ -33,8 +99,13 @@ size_t utf8Length(const Utf8Type* utf8, size_t remain) {
       continue;
     }
 
-    if (remain == 1)
-      throwMissingUtf8End();
+    if (remain == 1) {
+      // 1 invalid character with missing end
+      ++length;
+      --remain;
+      break;
+    }
+      //throwMissingUtf8End();
 
     if ((utf8[0] & 0xe0) == 0xc0 && (utf8[1] & 0xc0) == 0x80) {
       if (((utf8[0] & 0x1fL) << 6) >= 0x00000080L) {
@@ -43,12 +114,22 @@ size_t utf8Length(const Utf8Type* utf8, size_t remain) {
         remain -= 2;
         continue;
       } else {
-        throwInvalidUtf8Sequence();
+        // invalid, assume a single placeholder character
+        ++length;
+        ++utf8;
+        --remain;
+        continue;
+        //throwInvalidUtf8Sequence();
       }
     }
 
-    if (remain == 2)
-      throwMissingUtf8End();
+    if (remain == 2) {
+      // 2 invalid characters with missing end
+      length += 2;
+      remain -= 2;
+      break;
+    }
+      //throwMissingUtf8End();
 
     if ((utf8[0] & 0xf0) == 0xe0 && (utf8[1] & 0xc0) == 0x80 && (utf8[2] & 0xc0) == 0x80) {
       if ((((utf8[0] & 0x0fL) << 12) | ((utf8[1] & 0x3fL) << 6)) >= 0x00000800L) {
@@ -57,12 +138,21 @@ size_t utf8Length(const Utf8Type* utf8, size_t remain) {
         remain -= 3;
         continue;
       } else {
-        throwInvalidUtf8Sequence();
+        // invalid, assume a single placeholder character
+        ++length;
+        ++utf8;
+        --remain;
+        continue;
       }
     }
 
-    if (remain == 3)
-      throwMissingUtf8End();
+    if (remain == 3) {
+      // 3 invalid characters with missing end
+      length += 3;
+      remain -= 3;
+      break;
+    }
+      //throwMissingUtf8End();
 
     if ((utf8[0] & 0xf8) == 0xf0 && (utf8[1] & 0xc0) == 0x80 && (utf8[2] & 0xc0) == 0x80 && (utf8[3] & 0xc0) == 0x80) {
       if ((((utf8[0] & 0x07L) << 18) | ((utf8[1] & 0x3fL) << 12)) >= 0x00010000L) {
@@ -71,10 +161,18 @@ size_t utf8Length(const Utf8Type* utf8, size_t remain) {
         remain -= 4;
         continue;
       } else {
-        throwInvalidUtf8Sequence();
+        // invalid, assume a single placeholder character
+        ++length;
+        ++utf8;
+        --remain;
+        continue;
       }
     } else {
-      throwInvalidUtf8Sequence();
+      // invalid, assume a single placeholder character
+      ++length;
+      ++utf8;
+      --remain;
+      continue;
     }
   }
 
@@ -97,40 +195,53 @@ size_t utf8DecodeChar(const Utf8Type* utf8, Utf32Type* utf32, size_t remain) {
       return utf8 - start + 1;
     }
 
-    if (remain == 1)
-      throwMissingUtf8End();
+    if (remain == 1) {
+      *utf32 = Utf32Placeholder;
+      return utf8 - start + 1;
+    }
 
     if ((utf8[0] & 0xe0) == 0xc0 && (utf8[1] & 0xc0) == 0x80) {
       *utf32 = ((utf8[0] & 0x1fL) << 6) | ((utf8[1] & 0x3fL) << 0);
-      if (*utf32 >= 0x00000080L)
+      if (*utf32 >= 0x00000080L) {
         return utf8 - start + 2;
-      else
-        throwInvalidUtf8Sequence();
+      } else {
+        *utf32 = Utf32Placeholder;
+        return utf8 - start + 1;
+      }
     }
 
-    if (remain == 2)
-      throwMissingUtf8End();
+    if (remain == 2) {
+      *utf32 = Utf32Placeholder;
+      return utf8 - start + 1;
+    }
 
     if ((utf8[0] & 0xf0) == 0xe0 && (utf8[1] & 0xc0) == 0x80 && (utf8[2] & 0xc0) == 0x80) {
       *utf32 = ((utf8[0] & 0x0fL) << 12) | ((utf8[1] & 0x3fL) << 6) | ((utf8[2] & 0x3fL) << 0);
-      if (*utf32 >= 0x00000800L)
+      if (*utf32 >= 0x00000800L) {
         return utf8 - start + 3;
-      else
-        throwInvalidUtf8Sequence();
+      } else {
+        *utf32 = Utf32Placeholder;
+        return utf8 - start + 1;
+      }
     }
 
-    if (remain == 3)
-      throwMissingUtf8End();
+    if (remain == 3) {
+      *utf32 = Utf32Placeholder;
+      return utf8 - start + 1;
+    }
 
     if ((utf8[0] & 0xf8) == 0xf0 && (utf8[1] & 0xc0) == 0x80 && (utf8[2] & 0xc0) == 0x80 && (utf8[3] & 0xc0) == 0x80) {
       *utf32 =
           ((utf8[0] & 0x07L) << 18) | ((utf8[1] & 0x3fL) << 12) | ((utf8[2] & 0x3fL) << 6) | ((utf8[3] & 0x3fL) << 0);
-      if (*utf32 >= 0x00010000L)
+      if (*utf32 >= 0x00010000L) {
         return utf8 - start + 4;
-      else
-        throwInvalidUtf8Sequence();
+      } else {
+        *utf32 = Utf32Placeholder;
+        return utf8 - start + 1;
+      }
     } else {
-      throwInvalidUtf8Sequence();
+      *utf32 = Utf32Placeholder;
+      return utf8 - start + 1;
     }
   }
 
@@ -139,7 +250,7 @@ size_t utf8DecodeChar(const Utf8Type* utf8, Utf32Type* utf32, size_t remain) {
 
 size_t utf8EncodeChar(Utf8Type* utf8, Utf32Type utf32, size_t len) {
   if (utf32 > 0x10FFFFu)
-    throwInvalidUtf32CodePoint(utf32);
+    return utf8EncodeChar(utf8,Utf32Placeholder,len);
 
   if (utf32 <= 0x0000007fL) {
     if (len < 1)
@@ -212,7 +323,8 @@ Utf32Type hexStringToUtf32(std::string const& codepoint, Maybe<Utf32Type> previo
 
 std::string hexStringFromUtf32(Utf32Type character) {
   if (character > MAX_CODEPOINT)
-    throw UnicodeException("Codepoint too big in hexStringFromUtf32");
+    return hexStringFromUtf32(Utf32Placeholder);
+    //throw UnicodeException("Codepoint too big in hexStringFromUtf32");
   Utf32Type lead;
   Maybe<Utf32Type> trail;
   tie(lead, trail) = utf32ToUtf16SurrogatePair(character);
@@ -243,9 +355,9 @@ bool isUtf16TrailSurrogate(Utf32Type codepoint) {
 
 Utf32Type utf32FromUtf16SurrogatePair(Utf32Type lead, Utf32Type trail) {
   if (!isUtf16LeadSurrogate(lead))
-    throw UnicodeException("Invalid lead surrogate passed to utf32FromUtf16SurrogatePair");
+    return Utf32Placeholder;//throw UnicodeException("Invalid lead surrogate passed to utf32FromUtf16SurrogatePair");
   if (!isUtf16TrailSurrogate(trail))
-    throw UnicodeException("Invalid trail surrogate passed to utf32FromUtf16SurrogatePair");
+    return Utf32Placeholder;//throw UnicodeException("Invalid trail surrogate passed to utf32FromUtf16SurrogatePair");
 
   lead -= MIN_LEAD;
   trail -= MIN_TRAIL;
@@ -262,7 +374,7 @@ pair<Utf32Type, Maybe<Utf32Type>> utf32ToUtf16SurrogatePair(Utf32Type codepoint)
     Utf32Type trail = (codepoint & SURR_MASK) + MIN_TRAIL;
 
     if (!isUtf16LeadSurrogate(lead))
-      throw UnicodeException("Invalid codepoint passed to utf32ToUtf16SurrogatePair");
+      return utf32ToUtf16SurrogatePair(Utf32Placeholder);//throw UnicodeException("Invalid codepoint passed to utf32ToUtf16SurrogatePair");
 
     return {lead, trail};
   }

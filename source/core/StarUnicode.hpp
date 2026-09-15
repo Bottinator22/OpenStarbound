@@ -12,10 +12,14 @@ typedef char32_t Utf32Type;
 
 #define STAR_UTF32_REPLACEMENT_CHAR 0x000000b7L
 
+static Utf32Type const Utf32Placeholder = 0x00000048L;
+
 void throwInvalidUtf8Sequence();
 void throwMissingUtf8End();
 void throwInvalidUtf32CodePoint(Utf32Type val);
 
+// Returns false if the given string contains invalid characters.
+bool isValidUtf8(Utf8Type const* utf8, size_t size = NPos);
 // If passed NPos as a size, assumes modified UTF-8 and stops on NULL byte.
 // Otherwise, ignores NULL.
 size_t utf8Length(Utf8Type const* utf8, size_t size = NPos);
@@ -122,12 +126,18 @@ private:
   void decrement() {
     // Keep backtracking until we don't have a trailing character:
     unsigned count = 0;
-    while (((uint8_t) * --m_position & 0xC0u) == 0x80u)
+    BaseIterator previous(m_position);
+    while (((uint8_t) * --previous & 0xC0u) == 0x80u)
       ++count;
     // now check that the sequence was valid:
-    if (count != utf8_trailing_byte_count(*m_position))
-      invalid_sequence();
+    if (count != utf8_trailing_byte_count(*previous)) {
+      throw UnicodeException("UTF-8 component bytes do not match char byte length on backtrack");
+      //m_position--;
+      //m_value = pending_read;
+      //return;
+    }
     m_value = pending_read;
+    m_position = previous;
   }
 
   bool equal(const U8ToU32Iterator& that) const {
@@ -137,8 +147,11 @@ private:
   void extract_current() const {
     m_value = static_cast<Utf8Type>(*m_position);
     // we must not have a continuation character:
-    if (((uint8_t)m_value & 0xC0u) == 0x80u)
-      invalid_sequence();
+    if (((uint8_t)m_value & 0xC0u) == 0x80u) {
+      //throw UnicodeException("Unexpected UTF-8 continuation char");
+      m_value = Utf32Placeholder;
+      return;
+    }
     // see how many extra byts we have:
     unsigned extra = utf8_trailing_byte_count(*m_position);
     // extract the extra bits, 6 from each extra byte:
@@ -147,8 +160,11 @@ private:
       ++next;
       m_value <<= 6;
       auto entry = static_cast<uint8_t>(*next);
-      if ((c > 0) && ((entry & 0xC0u) != 0x80u))
-        invalid_sequence();
+      if ((c > 0) && ((entry & 0xC0u) != 0x80u)) {
+        //throw UnicodeException("UTF-8 found non-continuation char, expected continuation");
+        m_value = Utf32Placeholder;
+        return;
+      }
       m_value += entry & 0x3Fu;
     }
     // we now need to remove a few of the leftmost bits, but how many depends
@@ -158,8 +174,11 @@ private:
     };
     m_value &= masks[extra];
     // check the result:
-    if ((uint32_t)m_value > (uint32_t)0x10FFFFu)
-      invalid_sequence();
+    if ((uint32_t)m_value > (uint32_t)0x10FFFFu) {
+      //throw UnicodeException("UTF-8 char encodes invalid UTF-32 char {}.", (uint32_t)m_value);
+      m_value = Utf32Placeholder;
+      return;
+    }
   }
 
   BaseIterator m_position;
@@ -204,8 +223,11 @@ private:
   }
 
   void push(U32Type c) const {
-    if (c > 0x10FFFFu)
+    if (c > 0x10FFFFu) {
       invalid_utf32_code_point(c);
+      //push(Utf32Placeholder);
+      //return;
+    }
 
     if ((uint32_t)c < 0x80u) {
       *m_position++ = static_cast<Utf8Type>((uint32_t)c);
