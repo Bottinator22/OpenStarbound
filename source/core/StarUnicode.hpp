@@ -12,7 +12,7 @@ typedef char32_t Utf32Type;
 
 #define STAR_UTF32_REPLACEMENT_CHAR 0x000000b7L
 
-static Utf32Type const Utf32Placeholder = 0x00000048L;
+static Utf32Type const Utf32Placeholder = 0x0000fffdL;
 
 void throwInvalidUtf8Sequence();
 void throwMissingUtf8End();
@@ -39,6 +39,7 @@ Utf32Type utf32FromUtf16SurrogatePair(Utf32Type lead, Utf32Type trail);
 pair<Utf32Type, Maybe<Utf32Type>> utf32ToUtf16SurrogatePair(Utf32Type codepoint);
 
 // Bidirectional iterator that can make utf8 appear as utf32
+// Requires a begin and end specified (to prevent out of bounds reads with invalid utf8)
 template <class BaseIterator, class U32Type = Utf32Type>
 class U8ToU32Iterator {
 public:
@@ -48,9 +49,11 @@ public:
   typedef U32Type& reference;
   typedef std::bidirectional_iterator_tag iterator_category;
 
-  U8ToU32Iterator() : m_position(), m_value(pending_read) {}
+  U8ToU32Iterator() : m_position(), m_value(pending_read), m_begin(), m_end() {}
 
-  U8ToU32Iterator(BaseIterator b) : m_position(b), m_value(pending_read) {}
+  U8ToU32Iterator(BaseIterator b, BaseIterator begin, BaseIterator end) : m_position(b), m_value(pending_read), m_begin(begin), m_end(end) {}
+
+  U8ToU32Iterator(BaseIterator b, U8ToU32Iterator base) : m_position(b), m_value(pending_read), m_begin(base.m_begin), m_end(base.m_end) {}
 
   BaseIterator const& base() const {
     return m_position;
@@ -119,7 +122,30 @@ private:
   void increment() {
     // skip high surrogate first if there is one:
     unsigned c = utf8_byte_count(*m_position);
-    std::advance(m_position, c);
+    if (c > 1) {
+      // ensure the sequence is valid (invalid sequences are treated as individual characters)
+      BaseIterator next(m_position);
+      ++next;
+      for (unsigned i = 1; i < c; i++) {
+        if (next == m_end) {
+          // invalid character.
+          ++m_position;
+          m_value = pending_read;
+          return;
+        }
+        ++next;
+        auto entry = static_cast<uint8_t>(*next);
+        if ((entry & 0xC0u) != 0x80u) {
+          // invalid character.
+          ++m_position;
+          m_value = pending_read;
+          return;
+        }
+      }
+      m_position = next;
+    } else {
+      ++m_position;
+    }
     m_value = pending_read;
   }
 
@@ -127,14 +153,13 @@ private:
     // Keep backtracking until we don't have a trailing character:
     unsigned count = 0;
     BaseIterator previous(m_position);
-    while (((uint8_t) * --previous & 0xC0u) == 0x80u)
+    while (((uint8_t)*--previous & 0xC0u) == 0x80u && previous != m_begin)
       ++count;
     // now check that the sequence was valid:
     if (count != utf8_trailing_byte_count(*previous)) {
-      throw UnicodeException("UTF-8 component bytes do not match char byte length on backtrack");
-      //m_position--;
-      //m_value = pending_read;
-      //return;
+      m_position--;
+      m_value = pending_read;
+      return;
     }
     m_value = pending_read;
     m_position = previous;
@@ -157,6 +182,10 @@ private:
     // extract the extra bits, 6 from each extra byte:
     BaseIterator next(m_position);
     for (unsigned c = 0; c < extra; ++c) {
+      if (next == m_end) {
+        m_value = Utf32Placeholder;
+        return;
+      }
       ++next;
       m_value <<= 6;
       auto entry = static_cast<uint8_t>(*next);
@@ -183,6 +212,9 @@ private:
 
   BaseIterator m_position;
   mutable U32Type m_value;
+  
+  BaseIterator m_begin;
+  BaseIterator m_end;
 };
 
 // Output iterator
@@ -224,9 +256,9 @@ private:
 
   void push(U32Type c) const {
     if (c > 0x10FFFFu) {
-      invalid_utf32_code_point(c);
-      //push(Utf32Placeholder);
-      //return;
+      //invalid_utf32_code_point(c);
+      push(Utf32Placeholder);
+      return;
     }
 
     if ((uint32_t)c < 0x80u) {

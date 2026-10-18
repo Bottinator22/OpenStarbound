@@ -310,7 +310,8 @@ Utf32Type hexStringToUtf32(std::string const& codepoint, Maybe<Utf32Type> previo
   }
 
   if (hexBytes.size() > sizeof(Utf32Type))
-    throw UnicodeException("Codepoint size is too big in parseUnicodeCodepoint");
+    return Utf32Placeholder;
+    //throw UnicodeException("Codepoint size is too big in parseUnicodeCodepoint");
 
   auto res = fromBigEndian(*(Utf32Type*)hexBytes.ptr());
 

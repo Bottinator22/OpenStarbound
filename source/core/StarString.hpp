@@ -97,6 +97,7 @@ public:
 
   size_t size() const;
   size_t length() const;
+  bool isValid() const;
 
   void clear();
   void reserve(size_t n);

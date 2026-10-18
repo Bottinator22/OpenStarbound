@@ -12,6 +12,10 @@
 
 ## Planned
 
+### Security/multiplayer fixes
+- [ ] **Sanitise or validate Unicode before networking it.** Invalid Unicode no longer crashes, but can crash older/vanilla clients. Use `isValidUtf8`, `String::isValid`, and `StringView::isValid` to check validity.
+  - Add a method for quickly sanitizing Strings.
+
 ### Lumi
 
 - [ ] **Isolated virtual persistent storage for mods.** Give each mod its own sandboxed, persistent key/value or file store, so mods can save data without needing `safeScripts` turned off.
