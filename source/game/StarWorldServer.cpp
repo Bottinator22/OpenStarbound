@@ -77,9 +77,9 @@ WorldServer::~WorldServer() {
   for (auto& p : m_scriptContexts)
     p.second->uninit();
 
-  m_scriptContexts.clear();
   m_spawner.uninit();
   writeMetadata();
+  m_scriptContexts.clear();
   m_worldStorage->unloadAll(true);
 }
 
@@ -163,14 +163,17 @@ void WorldServer::setPause(bool pause) {
 }
 
 void WorldServer::initLua(UniverseServer* universe) {
-  m_luaRoot->addCallbacks("universe", LuaBindings::makeUniverseServerCallbacks(universe));
-  m_luaRoot->addCallbacks("celestial", LuaBindings::makeCelestialCallbacks(universe));
+  m_luaThreadCallbacks["universe"] = LuaBindings::makeUniverseServerCallbacks(universe);
+  m_luaThreadCallbacks["celestial"] = LuaBindings::makeCelestialCallbacks(universe);
+  m_luaRoot->addCallbacks("universe",m_luaThreadCallbacks["universe"]);
+  m_luaRoot->addCallbacks("celestial",m_luaThreadCallbacks["celestial"]);
   auto assets = Root::singleton().assets();
   for (auto& p : assets->json("/worldserver.config:scriptContexts").toObject()) {
     auto scriptComponent = make_shared<ScriptComponent>();
     scriptComponent->setScripts(jsonToStringList(p.second.toArray()));
-    scriptComponent->addThreadCallbacks("universe", LuaBindings::makeUniverseServerCallbacks(universe));
-    scriptComponent->addThreadCallbacks("celestial", LuaBindings::makeCelestialCallbacks(universe));
+    if (m_scriptStorage.contains(p.first)) {
+      scriptComponent->setScriptStorage(m_scriptStorage[p.first].toObject());
+    }
 
     m_scriptContexts.set(p.first, scriptComponent);
     scriptComponent->init(this);
@@ -313,17 +316,27 @@ bool WorldServer::addClient(ConnectionId clientId, SpawnTarget const& spawnTarge
 
   tracker.update(m_currentTime);
 
-  auto& clientInfo = m_clientInfo.add(clientId, make_shared<ClientInfo>(clientId, tracker));
+  auto& clientInfo = m_clientInfo.add(clientId, make_shared<ClientWorldInfo>(clientId, tracker));
   clientInfo->subWorldId = subWorldId;
-  clientInfo->local = isLocal;
-  clientInfo->admin = isAdmin;
+  auto otherClientId = invertMainSubWorldConnectionId(clientId);
+  if (m_clientInfo.contains(otherClientId))
+    clientInfo->info = m_clientInfo.get(otherClientId)->info;
+  else {
+    clientInfo->info = make_shared<ClientInfo>();
+  }
+  clientInfo->info->local = isLocal;
+  clientInfo->info->admin = isAdmin;
   clientInfo->clientState.setNetCompatibilityRules(netRules);
 
   if (auto layer = m_worldTemplate->weatherLayerAt(Vec2I::floor(playerStart)))
     clientInfo->weatherDomain = layer->domain;
 
+  for (auto& p : m_scriptContexts)
+    p.second->invoke("addClient", clientId, isLocal);
+  
   auto worldStartPacket = make_shared<WorldStartPacket>();
   auto& templateData = worldStartPacket->templateData = m_worldTemplate->store();
+  
   // this makes it possible to use custom InstanceWorlds without clients having the mod that adds their dungeon:
   if (templateData.optQueryString("worldParameters.primaryDungeon")
     && Root::singletonPtr()->configuration()->getPath("compatibility.customDungeonWorld").optBool().value(false))
@@ -337,39 +350,56 @@ bool WorldServer::addClient(ConnectionId clientId, SpawnTarget const& spawnTarge
   worldStartPacket->worldProperties = m_worldProperties;
   worldStartPacket->dungeonIdGravity = m_dungeonIdGravity;
   worldStartPacket->dungeonIdBreathable = m_dungeonIdBreathable;
-  worldStartPacket->protectedDungeonIds = m_protectedDungeonIds;
+  if (netRules.version() >= 20 || connectionHasPermission(clientId, WorldPermissionType::Build)) {
+    worldStartPacket->protectedDungeonIds = m_protectedDungeonIds;
+  } else {
+    worldStartPacket->protectedDungeonIds = m_protectedDungeonIds.combination(NoPermissionProtectedDungeonIds);
+    clientInfo->couldModify = false;
+  }
   worldStartPacket->clientId = clientId;
   worldStartPacket->localInterpolationMode = isLocal;
+  worldStartPacket->permissions = clientInfo->info->permissions;
   clientInfo->outgoingPackets.append(worldStartPacket);
+  
+  clientInfo->startSent = true;
 
   clientInfo->outgoingPackets.append(make_shared<CentralStructureUpdatePacket>(m_centralStructure.store()));
-
-  for (auto& p : m_scriptContexts)
-    p.second->invoke("addClient", clientId, isLocal);
 
   return true;
 }
 
 List<PacketPtr> WorldServer::removeClient(ConnectionId clientId) {
+  auto const canModify = connectionHasPermission(clientId, WorldPermissionType::Build);
   auto const& info = m_clientInfo.get(clientId);
 
   for (auto& p : m_scriptContexts)
     p.second->invoke("removeClient", clientId);
-
+  
   for (auto const& entityId : m_entityMap->entityIds()) {
     if (connectionForEntity(entityId) == clientId)
       removeEntity(entityId, false);
+    else if (entity(entityId)->originConnection() == clientId) {
+      if (canModify) {
+        // disown the entity so another connection doesn't replace them
+        entity(entityId)->setOriginConnection(ServerConnectionId);
+      } else {
+        removeEntity(entityId, false);
+      }
+    }
   }
 
   for (auto const& uuid : m_entityMessageResponses.keys()) {
-    if (m_entityMessageResponses[uuid].first == clientId) {
-      auto response = m_entityMessageResponses[uuid].second;
+    auto& entry = m_entityMessageResponses[uuid];
+    if (entry.first == clientId) {
+      auto response = entry.second;
       if (response.is<ConnectionId>()) {
         if (auto clientInfo = m_clientInfo.value(response.get<ConnectionId>()))
           clientInfo->outgoingPackets.append(make_shared<EntityMessageResponsePacket>(makeLeft("Client disconnected"), uuid));
       } else {
         response.get<RpcPromiseKeeper<Json>>().fail("Client disconnected");
       }
+      m_entityMessageResponses.remove(uuid);
+    } else if (entry.second.is<ConnectionId>() && entry.second.get<ConnectionId>() == clientId) {
       m_entityMessageResponses.remove(uuid);
     }
   }
@@ -425,8 +455,11 @@ List<EntityId> WorldServer::players() const {
   return playerIds;
 }
 
+
 void WorldServer::handleIncomingPackets(ConnectionId clientId, List<PacketPtr> const& packets) {
-  shared_ptr<ClientInfo> clientInfo = m_clientInfo.get(clientId);
+  shared_ptr<ClientWorldInfo> clientInfo = m_clientInfo.get(clientId);
+  bool canModify = connectionHasPermission(clientInfo->clientId, WorldPermissionType::Build);
+  bool canInteract = connectionHasPermission(clientInfo->clientId, WorldPermissionType::Interact);
   auto& root = Root::singleton();
   auto entityFactory = root.entityFactory();
   auto itemDatabase = root.itemDatabase();
@@ -455,28 +488,80 @@ void WorldServer::handleIncomingPackets(ConnectionId clientId, List<PacketPtr> c
       clientInfo->pendingSectors.addAll(clientInfo->activeSectors.difference(oldSectors));
 
     } else if (auto mtpacket = as<ModifyTileListPacket>(packet)) {
-      auto unappliedModifications = applyTileModifications(mtpacket->modifications, mtpacket->allowEntityOverlap);
-      if (!unappliedModifications.empty())
-        clientInfo->outgoingPackets.append(make_shared<TileModificationFailurePacket>(unappliedModifications));
-
+      if (!canModify) {
+        clientInfo->outgoingPackets.append(make_shared<TileModificationFailurePacket>(mtpacket->modifications));
+      } else {
+        auto liquidsDb = Root::singleton().liquidsDatabase();
+        auto materialDb = Root::singleton().materialDatabase();
+        TileModificationList sanitized;
+        TileModificationList rejected;
+        sanitized.reserve(mtpacket->modifications.size());
+        for (auto const& pair : mtpacket->modifications) {
+          bool ok = true;
+          if (auto pl = pair.second.ptr<PlaceLiquid>())
+            ok = liquidsDb->isValidLiquidId(pl->liquid);
+          else if (auto pm = pair.second.ptr<PlaceMaterial>())
+            ok = materialDb->isValidMaterialId(pm->material);
+          else if (auto pmod = pair.second.ptr<PlaceMod>())
+            ok = materialDb->isValidModId(pmod->mod);
+          if (ok)
+            sanitized.append(pair);
+          else {
+            rejected.append(pair);
+            Logger::warn("WorldServer: dropped tile mod with invalid id from client {}", clientId);
+          }
+        }
+        auto unappliedModifications = applyTileModifications(sanitized, mtpacket->allowEntityOverlap);
+        unappliedModifications.appendAll(rejected);
+        if (!unappliedModifications.empty())
+          clientInfo->outgoingPackets.append(make_shared<TileModificationFailurePacket>(unappliedModifications));
+      }
     } else if (auto rtpacket = as<ReplaceTileListPacket>(packet)) {
-      auto unappliedModifications = replaceTiles(rtpacket->modifications, rtpacket->tileDamage, rtpacket->applyDamage);
-      if (!unappliedModifications.empty())
-        clientInfo->outgoingPackets.append(make_shared<TileModificationFailurePacket>(unappliedModifications));
-
+      if (!canModify) {
+        clientInfo->outgoingPackets.append(make_shared<TileModificationFailurePacket>(rtpacket->modifications));
+      } else {
+        auto materialDb = Root::singleton().materialDatabase();
+        TileModificationList sanitized;
+        TileModificationList rejected;
+        for (auto const& pair : rtpacket->modifications) {
+          bool ok = true;
+          if (auto pm = pair.second.ptr<PlaceMaterial>())
+            ok = materialDb->isValidMaterialId(pm->material);
+          if (ok)
+            sanitized.append(pair);
+          else
+            rejected.append(pair);
+        }
+        auto unappliedModifications = replaceTiles(sanitized, rtpacket->tileDamage, rtpacket->applyDamage);
+        unappliedModifications.appendAll(rejected);
+        if (!unappliedModifications.empty())
+          clientInfo->outgoingPackets.append(make_shared<TileModificationFailurePacket>(unappliedModifications));
+      }
     } else if (auto dtgpacket = as<DamageTileGroupPacket>(packet)) {
-      damageTiles(dtgpacket->tilePositions, dtgpacket->layer, dtgpacket->sourcePosition, dtgpacket->tileDamage, dtgpacket->sourceEntity);
-
+      if (canModify) {
+        damageTiles(dtgpacket->tilePositions, dtgpacket->layer, dtgpacket->sourcePosition, dtgpacket->tileDamage, dtgpacket->sourceEntity);
+      }
     } else if (auto clpacket = as<CollectLiquidPacket>(packet)) {
-      if (auto item = collectLiquid(clpacket->tilePositions, clpacket->liquidId))
-        clientInfo->outgoingPackets.append(make_shared<GiveItemPacket>(item));
-
+      if (canModify) {
+        if (!Root::singleton().liquidsDatabase()->isValidLiquidId(clpacket->liquidId)) {
+          Logger::warn("WorldServer: dropped CollectLiquid with invalid liquid id {} from client {}", clpacket->liquidId, clientId);
+          continue;
+        }
+        if (auto item = collectLiquid(clpacket->tilePositions, clpacket->liquidId))
+          clientInfo->outgoingPackets.append(make_shared<GiveItemPacket>(item));
+      }
     } else if (auto sepacket = as<SpawnEntityPacket>(packet)) {
-      auto netRules = clientInfo->clientState.netCompatibilityRules();
-      auto entity = entityFactory->netLoadEntity(sepacket->entityType, std::move(sepacket->storeData), netRules);
-      entity->readNetState(std::move(sepacket->firstNetState), 0.0f, netRules);
-      addEntity(std::move(entity));
-
+      // disallow placing of tile entities
+      if (canModify || !(sepacket->entityType == EntityType::Object || sepacket->entityType == EntityType::Plant)) {
+        try {
+          auto netRules = clientInfo->clientState.netCompatibilityRules();
+          auto entity = entityFactory->netLoadEntity(sepacket->entityType, std::move(sepacket->storeData), netRules);
+          entity->readNetState(std::move(sepacket->firstNetState), 0.0f, netRules);
+          addEntity(std::move(entity),clientId);
+        } catch (std::exception const& e) {
+          Logger::warn("WorldServer: rejected SpawnEntity from client {}: {}", clientId, e.what());
+        }
+      }
     } else if (auto rdpacket = as<RequestDropPacket>(packet)) {
       auto drop = m_entityMap->get<ItemDrop>(rdpacket->dropEntityId);
       if (drop && drop->isMaster() && drop->canTake()) {
@@ -485,17 +570,47 @@ void WorldServer::handleIncomingPackets(ConnectionId clientId, List<PacketPtr> c
       }
 
     } else if (auto hit = as<HitRequestPacket>(packet)) {
-      if (hit->remoteHitRequest.destinationConnection() == ServerConnectionId)
-        m_damageManager->pushRemoteHitRequest(hit->remoteHitRequest);
-      else
+      if (hit->remoteHitRequest.destinationConnection() == ServerConnectionId) {
+        bool allowed = canModify;
+        if (!canModify) {
+          if (auto entity = m_entityMap->entity(hit->remoteHitRequest.targetEntityId)) {
+            if (auto tileEntity = as<TileEntity>(entity)) {
+              // can't hit tile entities
+            } else if (!canInteract && entity->persistent()) {
+              // can't harm persistent entities if interaction is disallowed
+            } else {
+              // everything else is fine
+              allowed = true;
+            }
+          }
+        }
+        if (allowed) {
+          m_damageManager->pushRemoteHitRequest(hit->remoteHitRequest);
+        }
+      } else {
         m_clientInfo.get(hit->remoteHitRequest.destinationConnection())->outgoingPackets.append(make_shared<HitRequestPacket>(hit->remoteHitRequest));
-
+      }
     } else if (auto damage = as<DamageRequestPacket>(packet)) {
-      if (damage->remoteDamageRequest.destinationConnection() == ServerConnectionId)
-        m_damageManager->pushRemoteDamageRequest(damage->remoteDamageRequest);
-      else
+      if (damage->remoteDamageRequest.destinationConnection() == ServerConnectionId) {
+        bool allowed = canModify;
+        if (!canModify) {
+          if (auto entity = m_entityMap->entity(damage->remoteDamageRequest.targetEntityId)) {
+            if (auto tileEntity = as<TileEntity>(entity)) {
+              // can't hit tile entities
+            } else if (!canInteract && entity->persistent()) {
+              // can't harm persistent entities if interaction is disallowed
+            } else {
+              // everything else is fine
+              allowed = true;
+            }
+          }
+        }
+        if (allowed) {
+          m_damageManager->pushRemoteDamageRequest(damage->remoteDamageRequest);
+        }
+      } else {
         m_clientInfo.get(damage->remoteDamageRequest.destinationConnection())->outgoingPackets.append(make_shared<DamageRequestPacket>(damage->remoteDamageRequest));
-
+      }
     } else if (auto damage = as<DamageNotificationPacket>(packet)) {
       m_damageManager->pushRemoteDamageNotification(damage->remoteDamageNotification);
       for (auto const& pair : m_clientInfo) {
@@ -506,35 +621,48 @@ void WorldServer::handleIncomingPackets(ConnectionId clientId, List<PacketPtr> c
     } else if (auto entityInteract = as<EntityInteractPacket>(packet)) {
       auto targetEntityConnection = connectionForEntity(entityInteract->interactRequest.targetId);
       if (targetEntityConnection == ServerConnectionId) {
-        auto interactResult = interact(entityInteract->interactRequest).result();
-        clientInfo->outgoingPackets.append(make_shared<EntityInteractResultPacket>(interactResult.take(), entityInteract->requestId, entityInteract->interactRequest.sourceId));
+        InteractAction result = InteractAction();
+        if (canInteract) {
+          auto interactResult = interact(entityInteract->interactRequest).result();
+          result = interactResult.take();
+        } else {
+          if (auto entity = as<InteractiveEntity>(m_entityMap->entity(entityInteract->interactRequest.targetId))) {
+            if (!connectionHasPermission(entity->originConnection(),WorldPermissionType::Interact) || !entity->persistent()) {
+              auto interactResult = interact(entityInteract->interactRequest).result();
+              result = interactResult.take();
+            }
+          }
+        }
+        clientInfo->outgoingPackets.append(make_shared<EntityInteractResultPacket>(result, entityInteract->requestId, entityInteract->interactRequest.sourceId));
       } else {
-        auto const& forwardClientInfo = m_clientInfo.get(targetEntityConnection);
-        forwardClientInfo->outgoingPackets.append(entityInteract);
+        auto const& forwardClientWorldInfo = m_clientInfo.get(targetEntityConnection);
+        forwardClientWorldInfo->outgoingPackets.append(entityInteract);
       }
 
     } else if (auto interactResult = as<EntityInteractResultPacket>(packet)) {
-      auto const& forwardClientInfo = m_clientInfo.get(connectionForEntity(interactResult->sourceEntityId));
-      forwardClientInfo->outgoingPackets.append(interactResult);
+      auto const& forwardClientWorldInfo = m_clientInfo.get(connectionForEntity(interactResult->sourceEntityId));
+      forwardClientWorldInfo->outgoingPackets.append(interactResult);
 
     } else if (auto entityCreate = as<EntityCreatePacket>(packet)) {
       if (!entityIdInSpace(entityCreate->entityId, clientInfo->clientId)) {
         throw WorldServerException::format("WorldServer received entity create packet with illegal entity id {}.", entityCreate->entityId);
       } else {
-        if (m_entityMap->entity(entityCreate->entityId)) {
-          Logger::error("WorldServer received duplicate entity create packet from client, deleting old entity {}", entityCreate->entityId);
-          removeEntity(entityCreate->entityId, false);
+        try {
+          if (m_entityMap->entity(entityCreate->entityId)) {
+            Logger::error("WorldServer received duplicate entity create packet from client, deleting old entity {}", entityCreate->entityId);
+            removeEntity(entityCreate->entityId, false);
+          }
+          auto netRules = clientInfo->clientState.netCompatibilityRules();
+          auto entity = entityFactory->netLoadEntity(entityCreate->entityType, entityCreate->storeData, netRules);
+          entity->readNetState(entityCreate->firstNetState, 0.0f, netRules);
+          entity->init(this, entityCreate->entityId, EntityMode::Slave, clientId);
+          m_entityMap->addEntity(entity);
+          if (clientInfo->interpolationTracker.interpolationEnabled())
+            entity->enableInterpolation(clientInfo->interpolationTracker.extrapolationHint());
+        } catch (std::exception const& e) {
+          Logger::warn("WorldServer: rejected EntityCreate from client {}: {}", clientId, e.what());
         }
-        auto netRules = clientInfo->clientState.netCompatibilityRules();
-        auto entity = entityFactory->netLoadEntity(entityCreate->entityType, entityCreate->storeData, netRules);
-        entity->readNetState(entityCreate->firstNetState, 0.0f, netRules);
-        entity->init(this, entityCreate->entityId, EntityMode::Slave);
-        m_entityMap->addEntity(entity);
-
-        if (clientInfo->interpolationTracker.interpolationEnabled())
-          entity->enableInterpolation(clientInfo->interpolationTracker.extrapolationHint());
       }
-
     } else if (auto entityUpdateSet = as<EntityUpdateSetPacket>(packet)) {
       float interpolationLeadTime = clientInfo->interpolationTracker.interpolationLeadTime();
       m_entityMap->forAllEntities([&](EntityPtr const& entity) {
@@ -547,36 +675,141 @@ void WorldServer::handleIncomingPackets(ConnectionId clientId, List<PacketPtr> c
       clientInfo->pendingForward = true;
 
     } else if (auto entityDestroy = as<EntityDestroyPacket>(packet)) {
-      if (auto entity = m_entityMap->entity(entityDestroy->entityId)) {
-        entity->readNetState(entityDestroy->finalNetState, clientInfo->interpolationTracker.interpolationLeadTime(), clientInfo->clientState.netCompatibilityRules());
-        // Before destroying the entity, we should make sure that the entity is
-        // using the absolute latest data, so we disable interpolation.
-        entity->disableInterpolation();
-        removeEntity(entityDestroy->entityId, entityDestroy->death);
+      // EntityDestroy on entities you do not own is weird. It is allowed here with permission checks.
+      auto entityConnection = connectionForEntity(entityDestroy->entityId);
+      if (clientInfo->info->admin || entityConnection == clientInfo->clientId || entityConnection == ServerConnectionId) {
+        if (auto entity = m_entityMap->entity(entityDestroy->entityId)) {
+          if (entityConnection != ServerConnectionId || (canModify || entity->originConnection() == clientInfo->clientId)) {
+            entity->readNetState(entityDestroy->finalNetState, clientInfo->interpolationTracker.interpolationLeadTime(), clientInfo->clientState.netCompatibilityRules());
+            // Before destroying the entity, we should make sure that the entity is
+            // using the absolute latest data, so we disable interpolation.
+            entity->disableInterpolation();
+            removeEntity(entityDestroy->entityId, entityDestroy->death);
+          }
+        }
+      } else {
+        Logger::warn("WorldServer: rejecting EntityDestroy from client {} of other client entity {}", clientId, entityDestroy->entityId);
       }
 
     } else if (auto disconnectWires = as<DisconnectAllWiresPacket>(packet)) {
-      for (auto wireEntity : atTile<WireEntity>(disconnectWires->entityPosition)) {
-        for (auto connection : wireEntity->connectionsForNode(disconnectWires->wireNode)) {
-          wireEntity->removeNodeConnection(disconnectWires->wireNode, connection);
-          for (auto connectedEntity : atTile<WireEntity>(connection.entityLocation))
-            connectedEntity->removeNodeConnection({otherWireDirection(disconnectWires->wireNode.direction), connection.nodeIndex}, WireConnection{disconnectWires->entityPosition, disconnectWires->wireNode.nodeIndex});
+      if (canModify) {
+        for (auto wireEntity : atTile<WireEntity>(disconnectWires->entityPosition)) {
+          for (auto connection : wireEntity->connectionsForNode(disconnectWires->wireNode)) {
+            wireEntity->removeNodeConnection(disconnectWires->wireNode, connection);
+            for (auto connectedEntity : atTile<WireEntity>(connection.entityLocation))
+              connectedEntity->removeNodeConnection({otherWireDirection(disconnectWires->wireNode.direction), connection.nodeIndex}, WireConnection{disconnectWires->entityPosition, disconnectWires->wireNode.nodeIndex});
+          }
         }
       }
-
     } else if (auto connectWire = as<ConnectWirePacket>(packet)) {
-      for (auto source : atTile<WireEntity>(connectWire->inputConnection.entityLocation)) {
-        for (auto target : atTile<WireEntity>(connectWire->outputConnection.entityLocation)) {
-          source->addNodeConnection(WireNode{WireDirection::Input, connectWire->inputConnection.nodeIndex}, connectWire->outputConnection);
-          target->addNodeConnection(WireNode{WireDirection::Output, connectWire->outputConnection.nodeIndex}, connectWire->inputConnection);
+      if (canModify) {
+        for (auto source : atTile<WireEntity>(connectWire->inputConnection.entityLocation)) {
+          for (auto target : atTile<WireEntity>(connectWire->outputConnection.entityLocation)) {
+            source->addNodeConnection(WireNode{WireDirection::Input, connectWire->inputConnection.nodeIndex}, connectWire->outputConnection);
+            target->addNodeConnection(WireNode{WireDirection::Output, connectWire->outputConnection.nodeIndex}, connectWire->inputConnection);
+          }
         }
       }
-
     } else if (auto findUniqueEntity = as<FindUniqueEntityPacket>(packet)) {
       clientInfo->outgoingPackets.append(make_shared<FindUniqueEntityResponsePacket>(findUniqueEntity->uniqueEntityId,
           m_worldStorage->findUniqueEntity(findUniqueEntity->uniqueEntityId)));
 
     } else if (auto entityMessagePacket = as<EntityMessagePacket>(packet)) {
+      auto rejectMessage = [&](String const& reason) {
+        Logger::warn("WorldServer: rejecting EntityMessage '{}' from client {}: {}",
+                     entityMessagePacket->message, clientId, reason);
+        clientInfo->outgoingPackets.append(make_shared<EntityMessageResponsePacket>(
+          makeLeft(reason), entityMessagePacket->uuid));
+      };
+
+      auto assetPathExists = [](String const& path) -> bool {
+        if (path.empty())
+          return false;
+        try {
+          auto assets = Root::singleton().assets();
+          String checkPath = AssetPath::split(path).basePath;
+          return !checkPath.empty() && assets->assetExists(checkPath);
+        } catch (std::exception const&) {
+          return false;
+        }
+      };
+
+      bool messageRejected = false;
+
+      if (entityMessagePacket->message == "playCinematic" && !entityMessagePacket->args.empty()) {
+        Json const& cinematicArg = entityMessagePacket->args.get(0);
+        bool valid = false;
+        if (cinematicArg.isType(Json::Type::Object)) {
+          // Inline cinematic definition - accept as-is.
+          valid = true;
+        } else if (cinematicArg.isType(Json::Type::String)) {
+          valid = assetPathExists(cinematicArg.toString());
+          if (!valid)
+            rejectMessage(strf("invalid cinematic asset path '{}'", cinematicArg.toString()));
+        } else if (!cinematicArg.isNull()) {
+          rejectMessage(strf("non-string/non-object cinematic argument of type {}", (int)cinematicArg.type()));
+        }
+        if (!valid)
+          messageRejected = true;
+
+      } else if (entityMessagePacket->message == "playAltMusic" && !entityMessagePacket->args.empty()) {
+        Json const& tracksArg = entityMessagePacket->args.get(0);
+        bool valid = true;
+        if (tracksArg.canConvert(Json::Type::Array)) {
+          for (auto const& trackJson : tracksArg.toArray()) {
+            if (!trackJson.isType(Json::Type::String) || !assetPathExists(trackJson.toString())) {
+              valid = false;
+              rejectMessage(strf("invalid music asset path '{}'", trackJson.toString()));
+              break;
+            }
+          }
+        } else if (tracksArg.isType(Json::Type::String)) {
+          if (!assetPathExists(tracksArg.toString())) {
+            valid = false;
+            rejectMessage(strf("invalid music asset path '{}'", tracksArg.toString()));
+          }
+        } else {
+          valid = false;
+          rejectMessage(strf("invalid playAltMusic argument of type {}", (int)tracksArg.type()));
+        }
+        if (!valid)
+          messageRejected = true;
+
+      } else if (entityMessagePacket->message == "warp" && !entityMessagePacket->args.empty()) {
+        Json const& warpArg = entityMessagePacket->args.get(0);
+        bool valid = false;
+        if (warpArg.isType(Json::Type::String)) {
+          try {
+            // parseWarpAction throws on malformed input; we just check it parses.
+            (void)parseWarpAction(warpArg.toString());
+            valid = true;
+          } catch (std::exception const& e) {
+            rejectMessage(strf("invalid warp action '{}': {}", warpArg.toString(), e.what()));
+          }
+        } else {
+          rejectMessage(strf("non-string warp argument of type {}", (int)warpArg.type()));
+        }
+        if (!valid)
+          messageRejected = true;
+
+      } else if (entityMessagePacket->message == "queueRadioMessage" && !entityMessagePacket->args.empty()) {
+        Json const& configArg = entityMessagePacket->args.get(0);
+        bool valid = false;
+        try {
+          // createRadioMessage throws RadioMessageDatabaseException on invalid input
+          // (unknown messageId, missing required fields, etc.).
+          (void)Root::singleton().radioMessageDatabase()->createRadioMessage(configArg);
+          valid = true;
+        } catch (std::exception const& e) {
+          rejectMessage(strf("invalid radio message: {}", e.what()));
+        }
+        if (!valid)
+          messageRejected = true;
+      }
+
+      if (messageRejected)
+        continue;
+
       EntityPtr entity;
       if (entityMessagePacket->entityId.is<EntityId>())
         entity = m_entityMap->entity(entityMessagePacket->entityId.get<EntityId>());
@@ -587,15 +820,18 @@ void WorldServer::handleIncomingPackets(ConnectionId clientId, List<PacketPtr> c
         clientInfo->outgoingPackets.append(make_shared<EntityMessageResponsePacket>(makeLeft("Unknown entity"), entityMessagePacket->uuid));
       } else {
         if (entity->isMaster()) {
-          if (auto response = entity->receiveMessage(clientId, entityMessagePacket->message, entityMessagePacket->args)) {
-            if (response->is<Json>())
-              clientInfo->outgoingPackets.append(make_shared<EntityMessageResponsePacket>(makeRight(response->get<Json>()), entityMessagePacket->uuid));
-            else {
-              // delay the response until this promise is done
-              m_entityMessagePromises[entityMessagePacket->uuid] = make_pair(clientId,response->get<RpcPromise<Json>>());
-            }
+          if (canInteract || !connectionHasPermission(entity->originConnection(),WorldPermissionType::Interact)) {
+            if (auto response = entity->receiveMessage(clientId, entityMessagePacket->message, entityMessagePacket->args)) {
+              if (response->is<Json>())
+                clientInfo->outgoingPackets.append(make_shared<EntityMessageResponsePacket>(makeRight(response->get<Json>()), entityMessagePacket->uuid));
+              else {
+                // delay the response until this promise is done
+                m_entityMessagePromises[entityMessagePacket->uuid] = make_pair(clientId, response->get<RpcPromise<Json>>());
+              }
+            } else
+              clientInfo->outgoingPackets.append(make_shared<EntityMessageResponsePacket>(makeLeft("Message not handled by entity"), entityMessagePacket->uuid));
           } else
-            clientInfo->outgoingPackets.append(make_shared<EntityMessageResponsePacket>(makeLeft("Message not handled by entity"), entityMessagePacket->uuid));
+            clientInfo->outgoingPackets.append(make_shared<EntityMessageResponsePacket>(makeLeft("No interact permissions."), entityMessagePacket->uuid));
         } else if (auto const& clientInfo = m_clientInfo.value(connectionForEntity(entity->entityId()))) {
           m_entityMessageResponses[entityMessagePacket->uuid] = {clientInfo->clientId, clientId};
           entityMessagePacket->fromConnection = clientId;
@@ -622,18 +858,19 @@ void WorldServer::handleIncomingPackets(ConnectionId clientId, List<PacketPtr> c
       clientInfo->outgoingPackets.append(make_shared<PongPacket>(pingPacket->time));
 
     } else if (auto updateWorldProperties = as<UpdateWorldPropertiesPacket>(packet)) {
-      // Kae: Properties set to null (nil from Lua) should be erased instead of lingering around
-      for (auto& pair : updateWorldProperties->updatedProperties) {
-        if (pair.second.isNull())
-          m_worldProperties.erase(pair.first);
-        else
-          m_worldProperties[pair.first] = pair.second;
+      if (canModify) {
+        // Kae: Properties set to null (nil from Lua) should be erased instead of lingering around
+        for (auto& pair : updateWorldProperties->updatedProperties) {
+          if (pair.second.isNull())
+            m_worldProperties.erase(pair.first);
+          else
+            m_worldProperties[pair.first] = pair.second;
+        }
+        for (auto const& pair : m_clientInfo)
+          pair.second->outgoingPackets.append(make_shared<UpdateWorldPropertiesPacket>(updateWorldProperties->updatedProperties));
       }
-      for (auto const& pair : m_clientInfo)
-        pair.second->outgoingPackets.append(make_shared<UpdateWorldPropertiesPacket>(updateWorldProperties->updatedProperties));
-
     } else if (auto updateWorldTemplate = as<UpdateWorldTemplatePacket>(packet)) {
-      if (!clientInfo->admin)
+      if (!clientInfo->info->admin)
         continue; // nuh-uh!
 
       auto newWorldTemplate = make_shared<WorldTemplate>(updateWorldTemplate->templateData);
@@ -707,8 +944,26 @@ List<EntityId> WorldServer::entityIds() const {
 void WorldServer::update(float dt) {
   m_currentTime += dt;
   ++m_currentStep;
-  for (auto const& pair : m_clientInfo)
+  for (auto const& pair : m_clientInfo) {
     pair.second->interpolationTracker.update(m_currentTime);
+    if (pair.second->clientState.netCompatibilityRules().version() < 20) {
+      auto canModify = connectionHasPermission(pair.first, WorldPermissionType::Build);
+      if (pair.second->couldModify != canModify) {
+        // permissions changed; update the client's tile protection so they know
+        if (canModify) {
+          for (auto const& dungeonId : NoPermissionProtectedDungeonIds) {
+            if (!m_protectedDungeonIds.contains(dungeonId))
+              pair.second->outgoingPackets.append(make_shared<UpdateTileProtectionPacket>(dungeonId, false));
+          }
+        } else {
+          for (auto const& dungeonId : NoPermissionProtectedDungeonIds) {
+            pair.second->outgoingPackets.append(make_shared<UpdateTileProtectionPacket>(dungeonId, true));
+          }
+        }
+      }
+      pair.second->couldModify = canModify;
+    }
+  }
 
   List<WorldAction> triggeredActions;
   eraseWhere(m_timers, [&triggeredActions, dt](pair<float, WorldAction>& timer) {
@@ -884,10 +1139,13 @@ EntityPtr WorldServer::entity(EntityId entityId) const {
 }
 
 void WorldServer::addEntity(EntityPtr const& entity, EntityId entityId) {
+  addEntity(entity,ServerConnectionId,entityId);
+}
+void WorldServer::addEntity(EntityPtr const& entity, ConnectionId connection, EntityId entityId) {
   if (!entity)
     return;
 
-  entity->init(this, m_entityMap->reserveEntityId(entityId), EntityMode::Master);
+  entity->init(this, m_entityMap->reserveEntityId(entityId), EntityMode::Master, connection);
   m_entityMap->addEntity(entity);
 
   if (auto tileEntity = as<TileEntity>(entity))
@@ -1419,6 +1677,12 @@ Maybe<pair<String, String>> WorldServer::pullNewPlanetType() {
   return {};
 }
 
+Maybe<float> WorldServer::sectorTimeToLive(Vec2I const& position) const {
+  if (auto s = m_worldStorage->sectorForPosition(position))
+    return m_worldStorage->sectorTimeToLive(*s);
+  return {};
+}
+
 bool WorldServer::isTileProtected(Vec2I const& pos) const {
   if (!m_tileProtectionEnabled)
     return false;
@@ -1440,8 +1704,10 @@ void WorldServer::setTileProtection(DungeonId dungeonId, bool isProtected) {
   }
 
   if (updated) {
-    for (auto const& pair : m_clientInfo)
-      pair.second->outgoingPackets.append(make_shared<UpdateTileProtectionPacket>(dungeonId, isProtected));
+    for (auto const& pair : m_clientInfo) {
+      if (pair.second->clientState.netCompatibilityRules().version() >= 20 || connectionHasPermission(pair.first, WorldPermissionType::Build) || !NoPermissionProtectedDungeonIds.contains(dungeonId))
+        pair.second->outgoingPackets.append(make_shared<UpdateTileProtectionPacket>(dungeonId, isProtected));
+    }
   
     Logger::info("Protected dungeonIds for world set to {}", m_protectedDungeonIds);
   }
@@ -1449,16 +1715,25 @@ void WorldServer::setTileProtection(DungeonId dungeonId, bool isProtected) {
 
 size_t WorldServer::setTileProtection(List<DungeonId> const& dungeonIds, bool isProtected) {
   List<PacketPtr> updates;
+  List<PacketPtr> permissionUpdates;
   updates.reserve(dungeonIds.size());
   for (auto const& dungeonId : dungeonIds)
-    if (isProtected ? m_protectedDungeonIds.add(dungeonId) : m_protectedDungeonIds.remove(dungeonId))
-      updates.append(make_shared<UpdateTileProtectionPacket>(dungeonId, isProtected));
+    if (isProtected ? m_protectedDungeonIds.add(dungeonId) : m_protectedDungeonIds.remove(dungeonId)) {
+      if (!NoPermissionProtectedDungeonIds.contains(dungeonId)) {
+        updates.append(make_shared<UpdateTileProtectionPacket>(dungeonId, isProtected));
+      } else {
+        permissionUpdates.append(make_shared<UpdateTileProtectionPacket>(dungeonId, isProtected));
+      }
+    }
 
   if (updates.empty())
     return 0;
 
-  for (auto const& pair : m_clientInfo)
+  for (auto const& pair : m_clientInfo) {
     pair.second->outgoingPackets.appendAll(updates);
+    if (pair.second->clientState.netCompatibilityRules().version() >= 20 || connectionHasPermission(pair.first, WorldPermissionType::Build))
+      pair.second->outgoingPackets.appendAll(permissionUpdates);
+  }
 
   auto newDungeonIds = m_protectedDungeonIds.values();
   sort(newDungeonIds);
@@ -1741,6 +2016,11 @@ TileModificationList WorldServer::doApplyTileModifications(TileModificationList 
       queueTileUpdates(pos);
 
     } else if (auto plpacket = modification.ptr<PlaceLiquid>()) {
+      if (!Root::singleton().liquidsDatabase()->isValidLiquidId(plpacket->liquid)) {
+        Logger::warn("WorldServer: rejected PlaceLiquid with invalid liquid id {} at ({}, {})",
+                     (int)plpacket->liquid, pos[0], pos[1]);
+        continue;// leave in `unapplied` so caller sees a failure
+      }
       modifyLiquid(pos, plpacket->liquid, plpacket->liquidLevel, true);
       m_liquidEngine->visitLocation(pos);
       m_fallingBlocksAgent->visitLocation(pos);
@@ -2130,7 +2410,7 @@ void WorldServer::queueUpdatePackets(ConnectionId clientId, bool sendRemoteUpdat
   }
 
   HashMap<ConnectionId, shared_ptr<EntityUpdateSetPacket>> updateSetPackets;
-  if (sendRemoteUpdates || clientInfo->local)
+  if (sendRemoteUpdates || clientInfo->info->local)
     updateSetPackets.add(ServerConnectionId, make_shared<EntityUpdateSetPacket>(ServerConnectionId));
   for (auto const& p : m_clientInfo) {
     if (p.first != clientId && p.second->pendingForward)
@@ -2427,6 +2707,11 @@ bool WorldServer::exposedToWeather(Vec2F const& pos) const {
   return false;
 }
 
+Maybe<String> WorldServer::activeWeather(Vec2F const& pos) const {
+  auto weather = weatherAt(pos);
+  return weather->activeWeather();
+}
+
 bool WorldServer::isUnderground(Vec2F const& pos) const {
   return m_worldTemplate->undergroundLevel() >= pos[1];
 }
@@ -2500,6 +2785,71 @@ float WorldServer::timeOfDay() const {
 
 LuaRootPtr WorldServer::luaRoot() {
   return m_luaRoot;
+}
+
+StringMap<LuaCallbacks> WorldServer::luaThreadCallbacks() const {
+  return m_luaThreadCallbacks;
+}
+
+bool WorldServer::connectionHasPermission(ConnectionId connection, WorldPermissionType permission) const {
+  if (connection == ServerConnectionId)
+    return true;
+  if (m_clientInfo.contains(connection)) {
+    auto client = m_clientInfo.get(connection);
+    if (client->info->admin)
+      return true;
+    if (client->info->permissions.build)
+      return true;
+    if (!client->info->permissions.interact)
+      return false;
+    if (permission == WorldPermissionType::Containers) {
+      return client->info->permissions.containers;
+    } else {
+      return permission == WorldPermissionType::Interact;
+    }
+  }
+  return true;
+}
+
+void WorldServer::setConnectionHasPermission(ConnectionId const& connectionId, WorldPermissionType const& permission, bool const& hasPermission) {
+  // can either provide main connection id or subworld connection id
+  shared_ptr<ClientInfo> info;
+  auto otherConnId = invertMainSubWorldConnectionId(connectionId);
+  auto main = m_clientInfo.maybe(connectionId);
+  auto other = m_clientInfo.maybe(otherConnId);
+  unsigned version;
+  if (main) {
+    info = (*main)->info;
+    version = (*main)->clientState.netCompatibilityRules().version();
+  } else if (other) {
+    info = (*other)->info;
+    version = (*other)->clientState.netCompatibilityRules().version();
+  } else {
+    // connection doesn't exist
+    return;
+  }
+  switch (permission) {
+    case WorldPermissionType::Build:
+      info->permissions.build = hasPermission;
+      break;
+    case WorldPermissionType::Containers:
+      info->permissions.containers = hasPermission;
+      break;
+    case WorldPermissionType::Interact:
+      info->permissions.interact = hasPermission;
+      break;
+    default:
+      return;
+      break;
+  }
+  if (version >= 20) {
+    if (main && (*main)->startSent) {
+      (*main)->outgoingPackets.append(make_shared<WorldPermissionsUpdate>(permission, hasPermission));
+    }
+    if (other && (*other)->startSent) {
+      (*other)->outgoingPackets.append(make_shared<WorldPermissionsUpdate>(permission, hasPermission));
+    }
+  }
 }
 
 RpcPromise<Vec2F> WorldServer::findUniqueEntity(String const& uniqueId) {
@@ -2642,11 +2992,20 @@ void WorldServer::readMetadata() {
   m_dungeonIdBreathable = transform<HashMap<DungeonId, bool>>(metadata.getArray("dungeonIdBreathable"), [](Json const& p) {
       return make_pair(p.getInt(0), p.getBool(1));
     });
+  
+  m_scriptStorage = metadata.getObject("scriptStorage",{});
 }
 
 void WorldServer::writeMetadata() {
   auto versioningDatabase = Root::singleton().versioningDatabase();
 
+  JsonObject worldScriptStorage;
+  for (auto& p : m_scriptContexts) {
+    auto scriptStorage = p.second->getScriptStorage();
+    if (!scriptStorage.empty())
+      worldScriptStorage[p.first] = std::move(scriptStorage);
+  }
+  
   Json metadata = JsonObject{
     {"playerStart", jsonFromVec2F(m_playerStart)},
     {"respawnInWorld", m_respawnInWorld},
@@ -2655,6 +3014,7 @@ void WorldServer::writeMetadata() {
     {"centralStructure", m_centralStructure.store()},
     {"protectedDungeonIds", jsonFromSet(m_protectedDungeonIds)},
     {"worldProperties", m_worldProperties},
+    {"scriptStorage",worldScriptStorage},
     {"spawningEnabled", m_spawner.active()},
     {"dungeonIdGravity", m_dungeonIdGravity.pairs().transformed([](auto const& p) -> Json {
         return JsonArray{p.first, p.second};
@@ -2677,10 +3037,10 @@ bool WorldServer::isVisibleToPlayer(RectF const& region) const {
   return false;
 }
 
-WorldServer::ClientInfo::ClientInfo(ConnectionId clientId, InterpolationTracker const trackerInit)
-  : clientId(clientId), subWorldId(MainClientWorldId), skyNetVersion(0), weatherNetVersion(0), pendingForward(false), started(false), local(false), admin(false), interpolationTracker(trackerInit) {}
+WorldServer::ClientWorldInfo::ClientWorldInfo(ConnectionId clientId, InterpolationTracker const trackerInit)
+  : clientId(clientId), subWorldId(MainClientWorldId), skyNetVersion(0), weatherNetVersion(0), pendingForward(false), started(false), info(nullptr), interpolationTracker(trackerInit) {}
 
-List<RectI> WorldServer::ClientInfo::monitoringRegions(EntityMapPtr const& entityMap) const {
+List<RectI> WorldServer::ClientWorldInfo::monitoringRegions(EntityMapPtr const& entityMap) const {
   return clientState.monitoringRegions([entityMap](EntityId entityId) -> Maybe<RectI> {
     if (auto entity = entityMap->entity(entityId))
       return RectI::integral(entity->metaBoundBox().translated(entity->position()));
@@ -2688,7 +3048,7 @@ List<RectI> WorldServer::ClientInfo::monitoringRegions(EntityMapPtr const& entit
   });
 }
 
-bool WorldServer::ClientInfo::needsDamageNotification(RemoteDamageNotification const& rdn) const {
+bool WorldServer::ClientWorldInfo::needsDamageNotification(RemoteDamageNotification const& rdn) const {
   if (clientId == connectionForEntity(rdn.sourceEntityId) || clientId == connectionForEntity(rdn.damageNotification.targetEntityId))
     return true;
 
@@ -2769,8 +3129,8 @@ void WorldServer::setTemplate(WorldTemplatePtr newTemplate) {
   m_worldTemplate = std::move(newTemplate);
   for (auto& client : clientIds()) {
     auto& info = m_clientInfo.get(client);
-    bool local = info->local;
-    bool isAdmin = info->admin;
+    bool local = info->info->local;
+    bool isAdmin = info->info->admin;
     auto netRules = info->clientState.netCompatibilityRules();
     auto subWorldId = info->subWorldId;
     SpawnTarget spawnTarget;

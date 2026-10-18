@@ -541,12 +541,12 @@ void MainInterface::preUpdate(float) {
   if (!m_client->paused())
     player->aim(cursorWorldPosition());
 
+  Set<PlayerBusyState> busyStates;
   if (m_paneManager.topPane({PaneLayer::Window, PaneLayer::ModalWindow}))
-    player->setBusyState(PlayerBusyState::Menu);
-  else if (m_chat->hasFocus())
-    player->setBusyState(PlayerBusyState::Chatting);
-  else
-    player->setBusyState(PlayerBusyState::None);
+    busyStates.add(PlayerBusyState::Menu);
+  if (m_chat->hasFocus())
+    busyStates.add(PlayerBusyState::Chatting);
+  player->setBusyStates(busyStates);
 }
 
 void MainInterface::update(float dt) {
@@ -682,10 +682,28 @@ void MainInterface::update(float dt) {
   if (auto worldClient = m_client->worldClient()) {
     if (worldClient->inWorld()) {
       if (auto cinematic = m_client->mainPlayer()->pullPendingCinematic()) {
-        if (*cinematic)
-          m_cinematicOverlay->load(Root::singleton().assets()->fetchJson(cinematic.take()));
-        else
+        if (*cinematic) {
+          Json definition;
+          try {
+            definition = Root::singleton().assets()->fetchJson(cinematic.take());
+          } catch (std::exception const& e) {
+            Logger::warn("MainInterface: failed to fetch cinematic: {}", e.what());
+            definition = Json();
+          }
+          if (definition.isType(Json::Type::Object)) {
+            try {
+              m_cinematicOverlay->load(definition);
+            } catch (std::exception const& e) {
+              Logger::warn("MainInterface: rejected malformed cinematic ({}), stopping overlay", e.what());
+              m_cinematicOverlay->stop();
+            }
+          } else {
+            Logger::warn("MainInterface: ignoring non-object cinematic of type {}", (int)definition.type());
+            m_cinematicOverlay->stop();
+          }
+        } else {
           m_cinematicOverlay->stop();
+        }
       }
     }
   }

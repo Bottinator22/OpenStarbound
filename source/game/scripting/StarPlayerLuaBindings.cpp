@@ -164,10 +164,10 @@ LuaCallbacks LuaBindings::makePlayerCallbacks(Player* player) {
 
   callbacks.registerCallback(   "interactRadius", [player]()         { return player->interactRadius();       });
   callbacks.registerCallback("setInteractRadius", [player](float radius) { player->setInteractRadius(radius); });
-  
-  callbacks.registerCallback("setRenderLayer", [player](Maybe<String> const& layer) { 
+
+  callbacks.registerCallback("setRenderLayer", [player](Maybe<String> const& layer) {
     if (layer)
-      player->setRenderLayer(parseRenderLayer(*layer)); 
+      player->setRenderLayer(parseRenderLayer(*layer));
     else
       player->setRenderLayer({});
   });
@@ -680,6 +680,22 @@ LuaCallbacks LuaBindings::makePlayerCallbacks(Player* player) {
   callbacks.registerCallback("playTime", [player]() { return player->log()->playTime(); });
 
   callbacks.registerCallback("introComplete", [player]() { return player->log()->introComplete(); });
+
+  callbacks.registerCallback("busyState", [player]() {
+      return PlayerBusyStateNames.getRight(player->busyState());
+    });
+  callbacks.registerCallback("busyStates", [player]() {
+      StringList names;
+      for (auto state : player->busyStates())
+        names.append(PlayerBusyStateNames.getRight(state));
+      return names;
+    });
+  callbacks.registerCallback("busyIndicatorHidden", [player](String const& state) {
+      return player->busyIndicatorHidden(PlayerBusyStateNames.getLeft(state));
+    });
+  callbacks.registerCallback("setBusyIndicatorHidden", [player](String const& state, bool hidden) {
+      player->setBusyIndicatorHidden(PlayerBusyStateNames.getLeft(state), hidden);
+    });
   callbacks.registerCallback("setIntroComplete", [player](bool complete) {
       return player->log()->setIntroComplete(complete);
     });
@@ -830,6 +846,10 @@ LuaCallbacks LuaBindings::makePlayerCallbacks(Player* player) {
 
   callbacks.registerCallback("setCameraFocusEntity", [player](Maybe<EntityId> const& entityId) {
     player->setCameraFocusEntity(entityId);
+  });
+
+  callbacks.registerCallback("setDeathParticleBurst", [player](Maybe<String> const& deathParticleBurst) {
+    player->setDeathParticleBurst(deathParticleBurst);
   });
 
   callbacks.registerCallback("headRotation", [player]() {

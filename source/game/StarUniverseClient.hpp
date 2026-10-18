@@ -12,6 +12,7 @@
 #include "StarWorldClientThread.hpp"
 #include "StarLuaComponents.hpp"
 #include "StarUniverse.hpp"
+#include "StarLockFile.hpp"
 
 // TODO: make this more thread safe
 
@@ -41,7 +42,7 @@ public:
   typedef LuaMessageHandlingComponent<LuaUpdatableComponent<LuaBaseComponent>> ScriptComponent;
   typedef shared_ptr<ScriptComponent> ScriptComponentPtr;
   
-  UniverseClient(PlayerStoragePtr playerStorage, StatisticsPtr statistics, String const& customWorldStorageDir);
+  UniverseClient(PlayerStoragePtr playerStorage, StatisticsPtr statistics, String const& universeClientStorageDir);
   ~UniverseClient();
 
   void setMainPlayer(PlayerPtr player);
@@ -139,6 +140,8 @@ public:
   RpcPromise<Json> sendUniverseMessage(ConnectionId const& connectionId, String const& message, JsonArray const& args = {}) override;
   
   Maybe<ChainableJsonMessageResponse> receiveMessage(String const& message, bool const& local, JsonArray const& args) override;
+  
+  void executeActionLater(UniverseAction action) override;
 
 private:
   struct ServerInfo {
@@ -157,7 +160,8 @@ private:
   StatisticsPtr m_statistics;
   PlayerPtr m_mainPlayer;
   
-  String m_customWorldStorageDirectory;
+  String m_storageDirectory;
+  Maybe<LockFile> m_storageDirectoryLock;
 
   shared_ptr<atomic<bool>> m_pause;
   ClockPtr m_universeClock;
@@ -202,6 +206,11 @@ private:
   
   HashMap<Uuid, RpcPromiseKeeper<Json>> m_universeMessageResponses;
   HashMap<Uuid, RpcPromise<Json>> m_universeMessagePromises;
+  
+  Uuid m_uuid = Uuid();
+  
+  mutable Mutex m_actionsMutex;
+  List<UniverseAction> m_actions;
 };
 
 }

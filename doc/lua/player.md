@@ -428,6 +428,30 @@ Sets whether the player is marked as having completed the intro instance.
 
 ---
 
+#### `String` player.busyState()
+
+Returns the strongest busy state the interface currently wants shown above the player: `"menu"` while a window pane is open, otherwise `"chatting"` while the chat box has focus, otherwise `"none"`.
+
+---
+
+#### `List<String>` player.busyStates()
+
+Returns every busy state that is currently active. A window pane can be open while the chat box has focus, in which case this contains both `"menu"` and `"chatting"`, whereas `busyState` only reports the stronger.
+
+---
+
+#### `bool` player.busyIndicatorHidden(`String` busyState)
+
+Returns whether the indicator for the specified busy state (`"chatting"` or `"menu"`) is currently hidden.
+
+---
+
+#### `void` player.setBusyIndicatorHidden(`String` busyState, `bool` hidden)
+
+Hides or shows the indicator for the specified busy state (`"chatting"` or `"menu"`). While an indicator is hidden, the strongest active state that is not hidden is shown instead. The setting stays until it is changed again, so a script that hides an indicator should show it again when it is done, for example in `uninit`.
+
+---
+
 #### `void` player.warp(`String` warpAction, [`String` animation], [`bool` deploy])
 
 Immediately warps the player to the specified warp target, optionally using the specified warp animation and deployment.

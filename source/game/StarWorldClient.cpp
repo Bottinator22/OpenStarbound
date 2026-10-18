@@ -25,6 +25,7 @@
 #include "StarCurve25519.hpp"
 
 #include "StarUniverseClientLuaBindings.hpp"
+#include "StarCelestialLuaBindings.hpp"
 
 namespace Star {
 
@@ -61,6 +62,8 @@ WorldClient::WorldClient(PlayerPtr mainPlayer, LuaRootPtr luaRoot, UniverseClien
   m_inWorld = false;
 
   m_luaRoot = luaRoot;
+  m_luaThreadCallbacks["universe"] = LuaBindings::makeUniverseClientThreadCallbacks(universe);
+  m_luaThreadCallbacks["celestial"] = LuaBindings::makeCelestialCallbacks(universe->celestialDatabase());
 
   m_mainPlayer = mainPlayer;
 
@@ -129,7 +132,10 @@ WorldClient::WorldClient(ClientSubWorldId subWorldId, UniverseClient* universe) 
   m_luaRoot = make_shared<LuaRoot>();
   m_luaRoot->luaEngine().setNullTerminated(false);
   m_luaRoot->tuneAutoGarbageCollection(m_clientConfig.getFloat("luaGcPause"), m_clientConfig.getFloat("luaGcStepMultiplier"));
-  m_luaRoot->addCallbacks("universe",LuaBindings::makeUniverseClientThreadCallbacks(universe));
+  m_luaThreadCallbacks["universe"] = LuaBindings::makeUniverseClientThreadCallbacks(universe);
+  m_luaThreadCallbacks["celestial"] = LuaBindings::makeCelestialCallbacks(universe->celestialDatabase());
+  m_luaRoot->addCallbacks("universe",m_luaThreadCallbacks["universe"]);
+  m_luaRoot->addCallbacks("celestial",m_luaThreadCallbacks["celestial"]);
 
   m_collisionGenerator.init([this](int x, int y) {
     if (!m_predictedTiles.empty()) {
@@ -1259,7 +1265,20 @@ void WorldClient::handleIncomingPackets(List<PacketPtr> const& packets) {
 
     } else if (auto worldParametersUpdate = as<WorldParametersUpdatePacket>(packet)) {
       m_worldTemplate->setWorldParameters(netLoadVisitableWorldParameters(worldParametersUpdate->parametersData));
-
+      
+    } else if (auto worldPermissionsUpdate = as<WorldPermissionsUpdate>(packet)) {
+      auto hasPermission = worldPermissionsUpdate->hasPermission;
+      switch (worldPermissionsUpdate->permission) {
+        case WorldPermissionType::Build:
+          m_permissions.build = hasPermission;
+          break;
+        case WorldPermissionType::Containers:
+          m_permissions.containers = hasPermission;
+          break;
+        case WorldPermissionType::Interact:
+          m_permissions.interact = hasPermission;
+          break;
+      }
     } else if (auto pongPacket = as<PongPacket>(packet)) {
       if (pongPacket->time)
         m_latency = Time::monotonicMilliseconds() - pongPacket->time;
@@ -1615,6 +1634,10 @@ void WorldClient::addEntity(EntityPtr const& entity, EntityId entityId) {
   }
 }
 
+void WorldClient::addEntity(EntityPtr const& entity, ConnectionId connection, EntityId entityId) {
+  addEntity(entity,entityId);
+}
+
 TileDamageResult WorldClient::damageTiles(List<Vec2I> const& pos, TileLayer layer, Vec2F const& sourcePosition, TileDamage const& tileDamage, Maybe<EntityId> sourceEntity) {
   if (!inWorld())
     return TileDamageResult::None;
@@ -1713,6 +1736,8 @@ WorldClient::BroadcastCallback& WorldClient::broadcastCallback() {
 
 bool WorldClient::isTileProtected(Vec2I const& pos) const {
   if (!inWorld())
+    return true;
+  if (!connectionHasPermission(0,WorldPermissionType::Build))
     return true;
 
   auto const& tile = m_tileArray->tile(pos);
@@ -2067,6 +2092,8 @@ void WorldClient::initWorld(WorldStartPacket const& startPacket) {
   m_dungeonIdGravity = startPacket.dungeonIdGravity;
   m_dungeonIdBreathable = startPacket.dungeonIdBreathable;
   m_protectedDungeonIds = startPacket.protectedDungeonIds;
+  
+  m_permissions = startPacket.permissions;
 
   m_geometry = WorldGeometry(m_worldTemplate->size());
 
@@ -2112,8 +2139,6 @@ void WorldClient::initWorld(WorldStartPacket const& startPacket) {
   for (auto& p : m_clientConfig.getObject("worldScriptContexts")) {
     auto scriptComponent = make_shared<ScriptComponent>();
     scriptComponent->setScripts(jsonToStringList(p.second.toArray()));
-    
-    scriptComponent->addThreadCallbacks("universe",LuaBindings::makeUniverseClientThreadCallbacks(m_universe));
 
     m_scriptContexts.set(p.first, scriptComponent);
     scriptComponent->init(this);
@@ -2478,6 +2503,12 @@ bool WorldClient::exposedToWeather(Vec2F const& pos) const {
   return false;
 }
 
+Maybe<String> WorldClient::activeWeather(Vec2F const& pos) const {
+  if (!inWorld())
+    return {};
+  return m_weather.activeWeather();
+}
+
 bool WorldClient::isUnderground(Vec2F const& pos) const {
   if (!inWorld())
     return true;
@@ -2612,6 +2643,26 @@ float WorldClient::timeOfDay() const {
 
 LuaRootPtr WorldClient::luaRoot() {
   return m_luaRoot;
+}
+
+StringMap<LuaCallbacks> WorldClient::luaThreadCallbacks() const {
+  return m_luaThreadCallbacks;
+}
+
+bool WorldClient::connectionHasPermission(ConnectionId connection, WorldPermissionType permission) const {
+  if (!m_headless)
+    if (m_mainPlayer->isAdmin()) {
+      return true;
+    }
+  if (m_permissions.build)
+    return true;
+  if (!m_permissions.interact)
+    return false;
+  if (permission == WorldPermissionType::Containers) {
+    return m_permissions.containers;
+  } else {
+    return permission == WorldPermissionType::Interact;
+  }
 }
 
 bool WorldClient::pullRequestedDestroy() {

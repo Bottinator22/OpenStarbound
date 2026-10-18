@@ -99,7 +99,7 @@ public:
   EntityType entityType() const override;
   ClientEntityMode clientEntityMode() const override;
 
-  void init(World* world, EntityId entityId, EntityMode mode) override;
+  void init(World* world, EntityId entityId, EntityMode mode, ConnectionId originConnection = ServerConnectionId) override;
   void uninit() override;
 
   Vec2F position() const override;
@@ -208,7 +208,7 @@ public:
   void render(RenderCallback* renderCallback) override;
 
   void renderLightSources(RenderCallback* renderCallback) override;
-  
+
   void setRenderLayer(Maybe<EntityRenderLayer> layer);
 
   Json getGenericProperty(String const& name, Json const& defaultValue = Json()) const;
@@ -403,6 +403,14 @@ public:
   bool isDeployed() const;
 
   void setBusyState(PlayerBusyState busyState);
+  // All the busy states the interface currently wants shown (a window can be open while the chat box has focus).
+  void setBusyStates(Set<PlayerBusyState> const& busyStates);
+  Set<PlayerBusyState> const& busyStates() const;
+  // The strongest of those (menu, then chatting), before any hidden indicators are applied.
+  PlayerBusyState busyState() const;
+  // Scripts can hide the indicator of a busy state. While hidden, requesting that state shows none instead.
+  void setBusyIndicatorHidden(PlayerBusyState busyState, bool hidden);
+  bool busyIndicatorHidden(PlayerBusyState busyState) const;
 
   // A hard move to a specified location
   void moveTo(Vec2F const& footPosition);
@@ -520,8 +528,10 @@ public:
 
   void setAnimationParameter(String name, Json value);
 
+  void setDeathParticleBurst(Maybe<String> const& deathParticleBurst);
+
 private:
-  typedef LuaMessageHandlingComponent<LuaStorableComponent<LuaActorMovementComponent<LuaUpdatableComponent<LuaWorldComponent<LuaBaseComponent>>>>> GenericScriptComponent;
+  typedef LuaMessageHandlingComponent<LuaStorableComponent<LuaActorMovementComponent<LuaUpdatableComponent<LuaEntityComponent<LuaBaseComponent>>>>> GenericScriptComponent;
   typedef shared_ptr<GenericScriptComponent> GenericScriptComponentPtr;
 
   typedef std::function<void(ItemPtr)> ItemSetFunc;
@@ -549,7 +559,7 @@ private:
 
   NetElementDynamicGroup<NetHumanoid> m_netHumanoid;
   NetElementData<Maybe<String>> m_deathParticleBurst;
-  LuaAnimationComponent<LuaUpdatableComponent<LuaWorldComponent<LuaBaseComponent>>> m_scriptedAnimator;
+  LuaAnimationComponent<LuaUpdatableComponent<LuaEntityComponent<LuaBaseComponent>>> m_scriptedAnimator;
   NetElementHashMap<String, Json> m_scriptedAnimationParameters;
   NetworkedAnimator::DynamicTarget m_humanoidDynamicTarget;
 
@@ -595,6 +605,10 @@ private:
 
   String m_teleportAnimationType;
   NetworkedAnimatorPtr m_effectsAnimator;
+  void updateBusyIndicator();
+  PlayerBusyState m_busyState = PlayerBusyState::None;
+  Set<PlayerBusyState> m_busyStates;
+  Set<PlayerBusyState> m_hiddenBusyIndicators;
   NetworkedAnimator::DynamicTarget m_effectsAnimatorDynamicTarget;
 
   float m_emoteCooldown;

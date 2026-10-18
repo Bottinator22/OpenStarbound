@@ -243,6 +243,16 @@ Maybe<ConnectionId> UniverseServer::findNick(String const& nick) const {
   return m_chatProcessor->findNick(nick);
 }
 
+String UniverseServer::clientAccount(ConnectionId clientId) const {
+  ReadLocker clientsLocker(m_clientsLock);
+  if (auto clientContext = m_clients.value(clientId)) {
+    if (!clientContext->account().empty())
+      return clientContext->account();
+  }
+  return "<anonymous>";
+}
+
+
 Maybe<Uuid> UniverseServer::uuidForClient(ConnectionId clientId) const {
   ReadLocker clientsLocker(m_clientsLock);
   if (auto clientContext = m_clients.value(clientId))
@@ -1266,18 +1276,51 @@ void UniverseServer::respondToCelestialRequests() {
 
 void UniverseServer::processChat() {
   RecursiveMutexLocker locker(m_mainLock);
-  ReadLocker clientsLocker(m_clientsLock);
+  ReadLocker clientsLocker(m_clientsLock, false);
+  RecursiveMutexLocker luaLocker(m_luaLock, false);
   
   for (auto const& p : take(m_pendingChat)) {
+    clientsLocker.lock();
     if (auto clientContext = m_clients.get(p.first)) {
+      clientsLocker.unlock();
       for (auto const& chat : p.second) {
-        auto& message = get<0>(chat);
+        auto message = get<0>(chat);
         auto sendMode = get<1>(chat);
-        auto& data = get<2>(chat);
+        auto data = get<2>(chat);
+        
+        bool discard = false;
+        luaLocker.lock();
+        for (auto& sc : m_scriptContexts) {
+          auto out = sc.second->invoke<Json>("chatMessage", p.first, message, ChatSendModeNames.getRight(sendMode), data);
+          if (out && *out) {
+            // chat message is being overridden.
+            auto& jout = *out;
+            if (jout.getBool("discard",false)) {
+              // discard message entirely.
+              discard = true;
+              break;
+            } else {
+              if (jout.contains("message")) {
+                message = jout.getString("message");
+              }
+              if (jout.contains("sendMode")) {
+                sendMode = ChatSendModeNames.getLeft(jout.getString("sendMode"));
+              }
+              if (jout.contains("data")) {
+                data = jout.getObject("data");
+              }
+            }
+          }
+        }
+        luaLocker.unlock();
+        if (discard)
+          continue;
+        
         if (clientContext->remoteAddress())
           Logger::info("Chat: <{}> {}", clientContext->playerName(), message);
 
         auto team = m_teamManager->getTeam(clientContext->playerUuid());
+        
         locker.unlock();
         if (sendMode == ChatSendMode::Broadcast)
           m_chatProcessor->broadcast(p.first, message, std::move(data));
@@ -1385,6 +1428,15 @@ void UniverseServer::handleUniverseMessages() {
       else
         keeper.fail("Message not handled by universe");
     }
+  }
+  
+  List<UniverseAction> actions;
+  {
+    MutexLocker locker(m_actionsMutex);
+    actions = take(m_actions);
+  }
+  for (auto action : actions) {
+    action(this);
   }
 }
 
@@ -2207,7 +2259,7 @@ void UniverseServer::acceptConnection(UniverseConnection connection, Maybe<HostA
 
   ConnectionId clientId = m_clients.nextId();
   auto clientContext = make_shared<ServerClientContext>(clientId, remoteAddress, netRules, clientConnect->playerUuid,
-                                                        clientConnect->playerName, clientConnect->shipSpecies, administrator, clientConnect->shipChunks);
+                                                        clientConnect->playerName, clientConnect->shipSpecies, administrator, clientConnect->shipChunks, clientConnect->account);
   clientContext->registerRpcHandlers(m_teamManager->authenticatedRpcHandlers(clientContext->playerUuid()));
 
   String clientContextFile = File::relativeTo(m_storageDirectory, strf("{}.clientcontext", clientConnect->playerUuid.hex()));
@@ -2303,6 +2355,7 @@ void UniverseServer::acceptConnection(UniverseConnection connection, Maybe<HostA
     m_connectionServer->sendPackets(clientId, {make_shared<ServerInfoPacket>(players, static_cast<uint16_t>(m_maxPlayers))});
   }
 
+  RecursiveMutexLocker luaLocker(m_luaLock);
   for (auto& p : m_scriptContexts)
     p.second->invoke("acceptConnection", clientId);
 }
@@ -2314,6 +2367,8 @@ WarpToWorld UniverseServer::resolveWarpAction(WarpAction warpAction, ConnectionI
 
   WorldId toWorldId;
   SpawnTarget spawnTarget;
+  
+  RecursiveMutexLocker luaLocker(m_luaLock);
   for (auto& p : m_scriptContexts) {
     auto out = p.second->invoke<Json>("overrideWarp", warpActionToJson(warpAction), clientId, deploy);
     if (out && *out) {
@@ -2329,6 +2384,7 @@ WarpToWorld UniverseServer::resolveWarpAction(WarpAction warpAction, ConnectionI
       return WarpToWorld(toWorldId, spawnTarget);
     }
   }
+  luaLocker.unlock();
 
   if (auto toWorld = warpAction.ptr<WarpToWorld>()) {
     if (!toWorld->world)
@@ -2414,12 +2470,15 @@ bool UniverseServer::canWarpToShip(ConnectionId clientId, Uuid const& targetShip
 void UniverseServer::doDisconnection(ConnectionId clientId, String const& reason) {
   RecursiveMutexLocker locker(m_mainLock);
   WriteLocker clientsLocker(m_clientsLock);
+  RecursiveMutexLocker luaLocker(m_luaLock,false);
   if (auto clientContext = m_clients.value(clientId)) {
+    clientsLocker.unlock();
+    luaLocker.lock();
     for (auto& p : m_scriptContexts)
       p.second->invoke("doDisconnection", clientId);
+    luaLocker.unlock();
 
     m_teamManager->playerDisconnected(clientContext->playerUuid());
-    clientsLocker.unlock();
     // The client should revive at their ship if they are in an un-revivable
     // state
     WarpToWorld reviveWarp = WarpToWorld(ClientShipWorldId(clientContext->playerUuid()));
@@ -3065,6 +3124,7 @@ void UniverseServer::startLuaScripts() {
   auto assets = Root::singleton().assets();
   auto universeConfig = assets->json("/universe_server.config");
 
+  RecursiveMutexLocker luaLocker(m_luaLock);
   m_luaRoot = make_shared<LuaRoot>();
   m_luaRoot->tuneAutoGarbageCollection(universeConfig.getFloat("luaGcPause"), universeConfig.getFloat("luaGcStepMultiplier"));
 
@@ -3083,11 +3143,13 @@ void UniverseServer::startLuaScripts() {
 }
 
 void UniverseServer::updateLua() {
+  RecursiveMutexLocker luaLocker(m_luaLock);
   for (auto& p : m_scriptContexts)
     p.second->update();
 }
 
 void UniverseServer::stopLua() {
+  RecursiveMutexLocker luaLocker(m_luaLock);
   for (auto& p : m_scriptContexts)
     p.second->uninit();
 
@@ -3125,6 +3187,7 @@ RpcPromise<Json> UniverseServer::sendUniverseMessage(ConnectionId const& connect
 
 Maybe<ChainableJsonMessageResponse> UniverseServer::receiveMessage(String const& message, bool const& local, JsonArray const& args) {
   Maybe<ChainableJsonMessageResponse> result;
+  RecursiveMutexLocker luaLocker(m_luaLock);
   for (auto& p : m_scriptContexts) {
     result = p.second->handleMessage(message, local, args);
     if (result)
@@ -3132,4 +3195,10 @@ Maybe<ChainableJsonMessageResponse> UniverseServer::receiveMessage(String const&
   }
   return result;
 }
+
+void UniverseServer::executeActionLater(UniverseAction action) {
+  MutexLocker locker(m_actionsMutex);
+  m_actions.append(action);
+}
+
 }// namespace Star

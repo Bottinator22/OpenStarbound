@@ -68,6 +68,8 @@ public:
   String clientNick(ConnectionId clientId) const;
   Maybe<ConnectionId> findNick(String const& nick) const;
 
+  String clientAccount(ConnectionId clientId) const;
+
   Maybe<Uuid> uuidForClient(ConnectionId clientId) const;
   Maybe<ConnectionId> clientForUuid(Uuid const& uuid) const;
 
@@ -124,6 +126,8 @@ public:
   RpcPromise<Json> sendUniverseMessage(ConnectionId const& connectionId, String const& message, JsonArray const& args = {}) override;
   
   Maybe<ChainableJsonMessageResponse> receiveMessage(String const& message, bool const& local, JsonArray const& args) override;
+  
+  void executeActionLater(UniverseAction action) override;
 
 protected:
   virtual void run() override;
@@ -303,6 +307,7 @@ private:
 
   List<TimeoutBan> m_tempBans;
 
+  mutable RecursiveMutex m_luaLock;
   LuaRootPtr m_luaRoot;
 
   typedef LuaMessageHandlingComponent<LuaUpdatableComponent<LuaBaseComponent>> ScriptComponent;
@@ -314,6 +319,9 @@ private:
   
   HashMap<Uuid, pair<ConnectionId, MVariant<ConnectionId, RpcPromiseKeeper<Json>>>> m_universeMessageResponses;
   HashMap<Uuid, pair<ConnectionId, RpcPromise<Json>>> m_universeMessagePromises;
+  
+  mutable Mutex m_actionsMutex;
+  List<UniverseAction> m_actions;
 };
 
 }
