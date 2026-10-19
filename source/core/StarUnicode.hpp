@@ -123,26 +123,26 @@ private:
     // skip high surrogate first if there is one:
     unsigned c = utf8_byte_count(*m_position);
     if (c > 1) {
-      // ensure the sequence is valid (invalid sequences are treated as individual characters)
+      // ensure the sequence is valid (invalid sequences are treated as individual characters) by going through the entire character
+      // if it's invalid, just increment once to the next character
       BaseIterator next(m_position);
-      ++next;
-      for (unsigned i = 1; i < c; i++) {
+      for (unsigned i = 0; i < c-1; i++) {
+        ++next;
         if (next == m_end) {
-          // invalid character.
           ++m_position;
           m_value = pending_read;
           return;
         }
-        ++next;
         auto entry = static_cast<uint8_t>(*next);
         if ((entry & 0xC0u) != 0x80u) {
-          // invalid character.
+          // this should be a continuation but isn't.
           ++m_position;
           m_value = pending_read;
           return;
         }
       }
-      m_position = next;
+      // if it's valid, go to the character after it (may equal m_end)
+      m_position = ++next;
     } else {
       ++m_position;
     }
@@ -182,14 +182,14 @@ private:
     // extract the extra bits, 6 from each extra byte:
     BaseIterator next(m_position);
     for (unsigned c = 0; c < extra; ++c) {
+      ++next;
       if (next == m_end) {
         m_value = Utf32Placeholder;
         return;
       }
-      ++next;
       m_value <<= 6;
       auto entry = static_cast<uint8_t>(*next);
-      if ((c > 0) && ((entry & 0xC0u) != 0x80u)) {
+      if ((entry & 0xC0u) != 0x80u) {
         //throw UnicodeException("UTF-8 found non-continuation char, expected continuation");
         m_value = Utf32Placeholder;
         return;
