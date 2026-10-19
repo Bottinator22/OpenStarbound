@@ -10,13 +10,7 @@ STAR_EXCEPTION(UnicodeException, StarException);
 typedef char Utf8Type;
 typedef char32_t Utf32Type;
 
-#define STAR_UTF32_REPLACEMENT_CHAR 0x000000b7L
-
-static Utf32Type const Utf32Placeholder = 0x0000fffdL;
-
-void throwInvalidUtf8Sequence();
-void throwMissingUtf8End();
-void throwInvalidUtf32CodePoint(Utf32Type val);
+#define STAR_UTF32_REPLACEMENT_CHAR 0x0000fffdL
 
 // Returns false if the given string contains invalid characters.
 bool isValidUtf8(Utf8Type const* utf8, size_t size = NPos);
@@ -99,10 +93,6 @@ private:
   // special values for pending iterator reads:
   static U32Type const pending_read = 0xffffffffu;
 
-  static void invalid_sequence() {
-    throwInvalidUtf8Sequence();
-  }
-
   static unsigned utf8_byte_count(Utf8Type c) {
     // if the most significant bit with a zero in it is in position
     // 8-N then there are N bytes in this UTF-8 sequence:
@@ -126,7 +116,7 @@ private:
       // ensure the sequence is valid (invalid sequences are treated as individual characters) by going through the entire character
       // if it's invalid, just increment once to the next character
       BaseIterator next(m_position);
-      for (unsigned i = 0; i < c-1; i++) {
+      for (unsigned i = 0; i < c - 1; i++) {
         ++next;
         if (next == m_end) {
           ++m_position;
@@ -173,8 +163,7 @@ private:
     m_value = static_cast<Utf8Type>(*m_position);
     // we must not have a continuation character:
     if (((uint8_t)m_value & 0xC0u) == 0x80u) {
-      //throw UnicodeException("Unexpected UTF-8 continuation char");
-      m_value = Utf32Placeholder;
+      m_value = STAR_UTF32_REPLACEMENT_CHAR;
       return;
     }
     // see how many extra byts we have:
@@ -184,14 +173,14 @@ private:
     for (unsigned c = 0; c < extra; ++c) {
       ++next;
       if (next == m_end) {
-        m_value = Utf32Placeholder;
+        m_value = STAR_UTF32_REPLACEMENT_CHAR;
         return;
       }
       m_value <<= 6;
       auto entry = static_cast<uint8_t>(*next);
       if ((entry & 0xC0u) != 0x80u) {
-        //throw UnicodeException("UTF-8 found non-continuation char, expected continuation");
-        m_value = Utf32Placeholder;
+        // Not a continuation char
+        m_value = STAR_UTF32_REPLACEMENT_CHAR;
         return;
       }
       m_value += entry & 0x3Fu;
@@ -203,16 +192,19 @@ private:
     };
     m_value &= masks[extra];
     // check the result:
-    if ((uint32_t)m_value > (uint32_t)0x10FFFFu) {
-      //throw UnicodeException("UTF-8 char encodes invalid UTF-32 char {}.", (uint32_t)m_value);
-      m_value = Utf32Placeholder;
+    static const uint32_t overlong[4] = {
+        0x00u, 0x80u, 0x800u, 0x10000u,
+    };
+    if ((uint32_t)m_value > (uint32_t)0x10FFFFu || (uint32_t)m_value < overlong[extra]) {
+      // Prevent overlong or invalid characters
+      m_value = STAR_UTF32_REPLACEMENT_CHAR;
       return;
     }
   }
 
   BaseIterator m_position;
   mutable U32Type m_value;
-  
+
   BaseIterator m_begin;
   BaseIterator m_end;
 };
@@ -250,14 +242,10 @@ public:
   }
 
 private:
-  static void invalid_utf32_code_point(U32Type val) {
-    throwInvalidUtf32CodePoint(val);
-  }
 
   void push(U32Type c) const {
     if (c > 0x10FFFFu) {
-      //invalid_utf32_code_point(c);
-      push(Utf32Placeholder);
+      push(STAR_UTF32_REPLACEMENT_CHAR);
       return;
     }
 

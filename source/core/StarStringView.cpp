@@ -50,11 +50,11 @@ size_t StringView::utf8Size() const {
 }
 
 StringView::const_iterator StringView::begin() const {
-  return const_iterator(m_view.begin(),m_view.begin(),m_view.end());
+  return const_iterator(m_view.begin(), m_view.begin(), m_view.end());
 }
 
 StringView::const_iterator StringView::end() const {
-  return const_iterator(m_view.end(),m_view.begin(),m_view.end());
+  return const_iterator(m_view.end(), m_view.begin(), m_view.end());
 }
 
 size_t StringView::size() const {

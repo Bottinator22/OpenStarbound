@@ -6,7 +6,7 @@
 
 namespace Star {
 
-unsigned const CurrentStreamVersion = 20; // update OpenProtocolVersion too!
+unsigned const CurrentStreamVersion = 21; // update OpenProtocolVersion too!
 
 DataStream::DataStream()
   : m_byteOrder(ByteOrder::BigEndian),
@@ -270,7 +270,12 @@ DataStream& DataStream::operator<<(const ByteArray& d) {
 }
 
 DataStream& DataStream::operator<<(const String& s) {
-  writeStringData(s.utf8Ptr(), s.utf8Size());
+  if (m_streamCompatibilityVersion < 21) {
+    auto sanitized = s.sanitize();
+    writeStringData(sanitized.utf8Ptr(), sanitized.utf8Size());
+  } else {
+    writeStringData(s.utf8Ptr(), s.utf8Size());
+  }
   return *this;
 }
 

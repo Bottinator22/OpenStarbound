@@ -117,6 +117,9 @@ public:
   bool beginsWith(Char beg, CaseSensitivity cs = CaseSensitive) const;
 
   String reverse() const;
+  
+  // Creates a new string from this string's content, with invalid UTF-8 replaced with replacement chars.
+  String sanitize() const;
 
   String rot13() const;
 
