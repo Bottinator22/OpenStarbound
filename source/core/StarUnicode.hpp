@@ -208,18 +208,12 @@ private:
     // we now need to remove a few of the leftmost bits, but how many depends
     // upon how many extra bytes we've extracted:
     static const Utf32Type masks[4] = {
-      0x7Fu,
-      0x7FFu,
-      0xFFFFu,
-      0x1FFFFFu,
+      0x7Fu, 0x7FFu, 0xFFFFu, 0x1FFFFFu
     };
     m_value &= masks[extra];
     // check the result:
     static const uint32_t overlong[4] = {
-      0x00u,
-      0x80u,
-      0x800u,
-      0x10000u,
+      0x00u, 0x80u, 0x800u, 0x10000u
     };
     if ((uint32_t)m_value > (uint32_t)0x10FFFFu || (uint32_t)m_value < overlong[extra]) {
       // Prevent overlong or invalid characters
