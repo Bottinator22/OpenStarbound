@@ -43,7 +43,7 @@ bool isValidUtf8(const Utf8Type* utf8, size_t remain) {
     if ((utf8[0] & 0xf0) == 0xe0 && (utf8[1] & 0xc0) == 0x80 && (utf8[2] & 0xc0) == 0x80) {
       auto utf32char = ((utf8[0] & 0x0fL) << 12) | ((utf8[1] & 0x3fL) << 6);
       // ensure it's not overlong, and ensure it's not a UTF16 surrogate
-      if (utf32char >= 0x00000800L && (utf32char < 0x0000d800L || utf32char > 0x0000dfffL)) {
+      if (utf32char >= 0x00000800L && !isUtf16Surrogate(utf32char)) {
         utf8 += 3;
         remain -= 3;
         continue;
@@ -116,7 +116,7 @@ size_t utf8Length(const Utf8Type* utf8, size_t remain) {
 
     if (remain == 2) {
       // 2 invalid characters with missing end
-      // only 1 byte remains so the next character must be either ASCII or invalid
+      // only 1 trailing byte remains so the next character must be either ASCII or invalid
       length += 2;
       remain -= 2;
       break;
@@ -125,7 +125,7 @@ size_t utf8Length(const Utf8Type* utf8, size_t remain) {
     if ((utf8[0] & 0xf0) == 0xe0 && (utf8[1] & 0xc0) == 0x80 && (utf8[2] & 0xc0) == 0x80) {
       auto utf32char = ((utf8[0] & 0x0fL) << 12) | ((utf8[1] & 0x3fL) << 6);
       // ensure it's not overlong, and ensure it's not a UTF16 surrogate
-      if (utf32char >= 0x00000800L && (utf32char < 0x0000d800L || utf32char > 0x0000dfffL)) {
+      if (utf32char >= 0x00000800L && !isUtf16Surrogate(utf32char)) {
         ++length;
         utf8 += 3;
         remain -= 3;
@@ -145,7 +145,7 @@ size_t utf8Length(const Utf8Type* utf8, size_t remain) {
       ++length;
       ++utf8;
       --remain;
-      break;
+      continue;
     }
 
     if ((utf8[0] & 0xf8) == 0xf0 && (utf8[1] & 0xc0) == 0x80 && (utf8[2] & 0xc0) == 0x80 && (utf8[3] & 0xc0) == 0x80) {
@@ -212,7 +212,7 @@ size_t utf8DecodeChar(const Utf8Type* utf8, Utf32Type* utf32, size_t remain) {
 
     if ((utf8[0] & 0xf0) == 0xe0 && (utf8[1] & 0xc0) == 0x80 && (utf8[2] & 0xc0) == 0x80) {
       *utf32 = ((utf8[0] & 0x0fL) << 12) | ((utf8[1] & 0x3fL) << 6) | ((utf8[2] & 0x3fL) << 0);
-      if (*utf32 >= 0x00000800L) {
+      if (*utf32 >= 0x00000800L && !isUtf16Surrogate(*utf32)) {
         return utf8 - start + 3;
       } else {
         *utf32 = STAR_UTF32_REPLACEMENT_CHAR;
@@ -227,8 +227,8 @@ size_t utf8DecodeChar(const Utf8Type* utf8, Utf32Type* utf32, size_t remain) {
 
     if ((utf8[0] & 0xf8) == 0xf0 && (utf8[1] & 0xc0) == 0x80 && (utf8[2] & 0xc0) == 0x80 && (utf8[3] & 0xc0) == 0x80) {
       *utf32 =
-          ((utf8[0] & 0x07L) << 18) | ((utf8[1] & 0x3fL) << 12) | ((utf8[2] & 0x3fL) << 6) | ((utf8[3] & 0x3fL) << 0);
-      if (*utf32 >= 0x00010000L) {
+        ((utf8[0] & 0x07L) << 18) | ((utf8[1] & 0x3fL) << 12) | ((utf8[2] & 0x3fL) << 6) | ((utf8[3] & 0x3fL) << 0);
+      if (*utf32 >= 0x00010000L && *utf32 <= 0x0010ffffL) {
         return utf8 - start + 4;
       } else {
         *utf32 = STAR_UTF32_REPLACEMENT_CHAR;
@@ -244,7 +244,7 @@ size_t utf8DecodeChar(const Utf8Type* utf8, Utf32Type* utf32, size_t remain) {
 }
 
 size_t utf8EncodeChar(Utf8Type* utf8, Utf32Type utf32, size_t len) {
-  if (utf32 > 0x10FFFFu)
+  if (utf32 > 0x10FFFFu || isUtf16Surrogate(utf32))
     return utf8EncodeChar(utf8, STAR_UTF32_REPLACEMENT_CHAR, len);
 
   if (utf32 <= 0x0000007fL) {
@@ -376,4 +376,4 @@ pair<Utf32Type, Maybe<Utf32Type>> utf32ToUtf16SurrogatePair(Utf32Type codepoint)
   return {codepoint, {}};
 }
 
-}
+}// namespace Star

@@ -185,6 +185,29 @@ TEST(StringTest, utf8) {
                    "𥄫𦉘𦟌𦧲𦧺𧨾𨅝𨈇𨋢𨳊𨳍𨳒𩶘")
                 .size(),
       62u);
+
+  // TODO: more tests
+  auto testString = [&](char const* bytes, size_t len, bool valid = false, size_t expectedLen = NPos) {
+    if (expectedLen == NPos) expectedLen = len;
+    String str = String(bytes,len);
+    EXPECT_EQ(str.length(), expectedLen);
+    EXPECT_EQ(isValidUtf8(bytes,len),valid);
+    EXPECT_EQ(utf8Length(bytes,len),expectedLen);
+    EXPECT_EQ(str.sanitize().length(), expectedLen);
+    EXPECT_EQ(str.sanitize().isValid(),true);
+  };
+  testString((char[]){'\x80'},1);
+  testString((char[]){'\xc0'},1);
+  testString((char[]){'\xc0','\xa1'},1);
+  testString((char[]){'\x80','\xc0'},1);
+  testString((char[]){'\xc3','\xbf'},2,true,1);
+  testString((char[]){'\x80','\xc3','\xbf'},3,false,2);
+  testString((char[]){'\xc3','\xc3','\xbf'},3,false,2);
+  testString((char[]){'\xe3','\xc3','\xbf'},3,false,2);
+  testString((char[]){'\xe3','\xbf'},2);
+  testString((char[]){'\xf3','\xbf'},2);
+  testString((char[]){'\xf3','\xbf','\xbf'},2);
+
 }
 
 TEST(StringTest, tags) {

@@ -28,6 +28,9 @@ std::string hexStringFromUtf32(Utf32Type character);
 
 bool isUtf16LeadSurrogate(Utf32Type codepoint);
 bool isUtf16TrailSurrogate(Utf32Type codepoint);
+inline bool isUtf16Surrogate(Utf32Type codepoint) {
+  return codepoint >= 0xd800 && codepoint <= 0xdfff;
+};
 
 Utf32Type utf32FromUtf16SurrogatePair(Utf32Type lead, Utf32Type trail);
 pair<Utf32Type, Maybe<Utf32Type>> utf32ToUtf16SurrogatePair(Utf32Type codepoint);
@@ -111,32 +114,49 @@ private:
 
   void increment() {
     // skip high surrogate first if there is one:
+    m_value = pending_read;
     unsigned c = utf8_byte_count(*m_position);
     if (c > 1) {
-      // ensure the sequence is valid (invalid sequences are treated as individual characters) by going through the entire character
+      // ensure the sequence is valid (invalid sequences are treated as individual characters) by decoding the entire character
       // if it's invalid, just increment once to the next character
       BaseIterator next(m_position);
-      for (unsigned i = 0; i < c - 1; i++) {
+      uint32_t value = *m_position;
+      auto extra = c - 1;
+      for (unsigned i = 0; i < extra; i++) {
         ++next;
         if (next == m_end) {
           ++m_position;
-          m_value = pending_read;
           return;
         }
+        value <<= 6;
         auto entry = static_cast<uint8_t>(*next);
         if ((entry & 0xC0u) != 0x80u) {
           // this should be a continuation but isn't.
           ++m_position;
-          m_value = pending_read;
           return;
         }
+        value += entry & 0x3Fu;
+      }
+      // we now need to remove a few of the leftmost bits, but how many depends
+      // upon how many extra bytes we've extracted:
+      static const uint32_t masks[4] = {
+        0x7Fu, 0x7FFu, 0xFFFFu, 0x1FFFFFu
+      };
+      value &= masks[extra];
+
+      static const uint32_t overlong[4] = {
+        0x00u, 0x80u, 0x800u, 0x10000u
+      };
+      if (value > (uint32_t)0x10FFFFu || value < overlong[extra] || isUtf16Surrogate(value)) {
+        // This is overlong, invalid, or a UTF16 surrogate
+        ++m_position;
+        return;
       }
       // if it's valid, go to the character after it (may equal m_end)
       m_position = ++next;
     } else {
       ++m_position;
     }
-    m_value = pending_read;
   }
 
   void decrement() {
@@ -188,12 +208,18 @@ private:
     // we now need to remove a few of the leftmost bits, but how many depends
     // upon how many extra bytes we've extracted:
     static const Utf32Type masks[4] = {
-        0x7Fu, 0x7FFu, 0xFFFFu, 0x1FFFFFu,
+      0x7Fu,
+      0x7FFu,
+      0xFFFFu,
+      0x1FFFFFu,
     };
     m_value &= masks[extra];
     // check the result:
     static const uint32_t overlong[4] = {
-        0x00u, 0x80u, 0x800u, 0x10000u,
+      0x00u,
+      0x80u,
+      0x800u,
+      0x10000u,
     };
     if ((uint32_t)m_value > (uint32_t)0x10FFFFu || (uint32_t)m_value < overlong[extra]) {
       // Prevent overlong or invalid characters
@@ -242,7 +268,6 @@ public:
   }
 
 private:
-
   void push(U32Type c) const {
     if (c > 0x10FFFFu) {
       push(STAR_UTF32_REPLACEMENT_CHAR);
@@ -269,4 +294,4 @@ private:
   mutable BaseIterator m_position;
 };
 
-}
+}// namespace Star
