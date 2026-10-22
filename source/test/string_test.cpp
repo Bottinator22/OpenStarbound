@@ -1,5 +1,6 @@
 #include "StarString.hpp"
 #include "StarFormat.hpp"
+#include "StarEncode.hpp"
 
 #include "gtest/gtest.h"
 
@@ -186,27 +187,52 @@ TEST(StringTest, utf8) {
                 .size(),
       62u);
 
-  // TODO: more tests
-  auto testString = [&](char const* bytes, size_t len, bool valid = false, size_t expectedLen = NPos) {
+  auto testString = [&](std::string utf8str, bool valid = false, size_t expectedLen = NPos) {
+    size_t len = utf8str.length();
+    char const* bytes = utf8str.c_str();
+    String hexStr = hexEncode(bytes,len);
     if (expectedLen == NPos) expectedLen = len;
-    String str = String(bytes,len);
-    EXPECT_EQ(str.length(), expectedLen);
+
     EXPECT_EQ(isValidUtf8(bytes,len),valid);
-    EXPECT_EQ(utf8Length(bytes,len),expectedLen);
-    EXPECT_EQ(str.sanitize().length(), expectedLen);
-    EXPECT_EQ(str.sanitize().isValid(),true);
+
+    String str = String(bytes,len);
+    size_t u32len = str.length();
+
+    size_t forwardcount = 0;
+    for (auto c : str) {
+      _unused(c);
+      forwardcount++;
+    }
+    size_t reversecount = 0;
+    auto it = str.end();
+    auto begin = str.begin();
+    while (it != begin) {
+      --it;
+      reversecount++;
+    }
+    EXPECT_EQ(u32len, expectedLen) << "Tested string: " << hexStr;
+    EXPECT_EQ(forwardcount, expectedLen) << "Tested string: " << hexStr;
+    EXPECT_EQ(reversecount, expectedLen) << "Tested string: " << hexStr;
+    EXPECT_EQ(str.sanitize().length(), expectedLen) << "Tested string: " << hexStr;
+    EXPECT_EQ(str.sanitize().isValid(),true) << "Tested string: " << hexStr;
   };
-  testString((char[]){'\x80'},1);
-  testString((char[]){'\xc0'},1);
-  testString((char[]){'\xc0','\xa1'},1);
-  testString((char[]){'\x80','\xc0'},1);
-  testString((char[]){'\xc3','\xbf'},2,true,1);
-  testString((char[]){'\x80','\xc3','\xbf'},3,false,2);
-  testString((char[]){'\xc3','\xc3','\xbf'},3,false,2);
-  testString((char[]){'\xe3','\xc3','\xbf'},3,false,2);
-  testString((char[]){'\xe3','\xbf'},2);
-  testString((char[]){'\xf3','\xbf'},2);
-  testString((char[]){'\xf3','\xbf','\xbf'},2);
+  testString("\x80");
+  testString("\xc0");
+  testString("\xc0\xa1");
+  testString("\x80\xc0");
+  testString("\xc3\xbf",true,1);
+  testString("\x80\xc3\xbf",false,2);
+  testString("\xc3\xc3\xbf",false,2);
+  testString("\xe3\xc3\xbf",false,2);
+  testString("\xc3\xbf\x80",false,2);
+  testString("\xe3\xbf");
+  testString("\xf3\xbf");
+  testString("\xf3\xbf\xbf");
+  testString("\xed\xa0\x80");
+  testString("\xf4\x90\x80\x80");
+  testString("\xf8\x90\x80\x80");
+  testString("\xe0\x80\x80\x80");
+  testString("\xf0\x80\x80\x80");
 
 }
 

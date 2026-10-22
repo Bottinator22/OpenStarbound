@@ -30,7 +30,7 @@ bool isUtf16LeadSurrogate(Utf32Type codepoint);
 bool isUtf16TrailSurrogate(Utf32Type codepoint);
 inline bool isUtf16Surrogate(Utf32Type codepoint) {
   return codepoint >= 0xd800 && codepoint <= 0xdfff;
-};
+}
 
 Utf32Type utf32FromUtf16SurrogatePair(Utf32Type lead, Utf32Type trail);
 pair<Utf32Type, Maybe<Utf32Type>> utf32ToUtf16SurrogatePair(Utf32Type codepoint);
@@ -93,8 +93,10 @@ public:
   }
 
 private:
-  // special values for pending iterator reads:
+  // special value for pending iterator reads:
   static U32Type const pending_read = 0xffffffffu;
+  // special value for internal 'invalid' chars, to avoid cases where valid characters matching the placeholder are treated as invalid
+  static U32Type const invalid = 0xfffffffeu;
 
   static unsigned utf8_byte_count(Utf8Type c) {
     // if the most significant bit with a zero in it is in position
@@ -112,6 +114,47 @@ private:
     return utf8_byte_count(c) - 1;
   }
 
+  U32Type getU32(BaseIterator at) const {
+    // returns the invalid value where invalid
+    U32Type value = static_cast<Utf8Type>(*at);
+    // we must not have a continuation character, and the lead must be valid (>0xf8 is too long, 0xf5-0xf7 always encode invalid chars (above 0x10ffff))
+    if (((uint8_t)value & 0xC0u) == 0x80u || (uint8_t)value > 0xf5u) {
+      return invalid;
+    }
+    // see how many extra byts we have:
+    unsigned extra = utf8_trailing_byte_count(*at);
+    // extract the extra bits, 6 from each extra byte:
+    BaseIterator next(at);
+    for (unsigned c = 0; c < extra; ++c) {
+      ++next;
+      if (next == m_end) {
+        return invalid;
+      }
+      value <<= 6;
+      auto entry = static_cast<uint8_t>(*next);
+      if ((entry & 0xC0u) != 0x80u) {
+        // Not a continuation char
+        return invalid;
+      }
+      value += entry & 0x3Fu;
+    }
+    // we now need to remove a few of the leftmost bits, but how many depends
+    // upon how many extra bytes we've extracted:
+    static const Utf32Type masks[4] = {
+      0x7Fu, 0x7FFu, 0xFFFFu, 0x1FFFFFu
+    };
+    value &= masks[extra];
+    // check the result:
+    static const uint32_t overlong[4] = {
+      0x00u, 0x80u, 0x800u, 0x10000u
+    };
+    if ((uint32_t)value > (uint32_t)0x10FFFFu || (uint32_t)value < overlong[extra] || isUtf16Surrogate(value)) {
+      // Prevent overlong or invalid characters
+      return invalid;
+    }
+    return value;
+  }
+
   void increment() {
     // skip high surrogate first if there is one:
     m_value = pending_read;
@@ -119,41 +162,11 @@ private:
     if (c > 1) {
       // ensure the sequence is valid (invalid sequences are treated as individual characters) by decoding the entire character
       // if it's invalid, just increment once to the next character
-      BaseIterator next(m_position);
-      uint32_t value = *m_position;
-      auto extra = c - 1;
-      for (unsigned i = 0; i < extra; i++) {
-        ++next;
-        if (next == m_end) {
-          ++m_position;
-          return;
-        }
-        value <<= 6;
-        auto entry = static_cast<uint8_t>(*next);
-        if ((entry & 0xC0u) != 0x80u) {
-          // this should be a continuation but isn't.
-          ++m_position;
-          return;
-        }
-        value += entry & 0x3Fu;
-      }
-      // we now need to remove a few of the leftmost bits, but how many depends
-      // upon how many extra bytes we've extracted:
-      static const uint32_t masks[4] = {
-        0x7Fu, 0x7FFu, 0xFFFFu, 0x1FFFFFu
-      };
-      value &= masks[extra];
-
-      static const uint32_t overlong[4] = {
-        0x00u, 0x80u, 0x800u, 0x10000u
-      };
-      if (value > (uint32_t)0x10FFFFu || value < overlong[extra] || isUtf16Surrogate(value)) {
-        // This is overlong, invalid, or a UTF16 surrogate
+      if (getU32(m_position) == invalid) {
         ++m_position;
-        return;
+      } else {
+        std::advance(m_position,c);
       }
-      // if it's valid, go to the character after it (may equal m_end)
-      m_position = ++next;
     } else {
       ++m_position;
     }
@@ -166,7 +179,7 @@ private:
     while (((uint8_t)*--previous & 0xC0u) == 0x80u && previous != m_begin)
       ++count;
     // now check that the sequence was valid:
-    if (count != utf8_trailing_byte_count(*previous)) {
+    if (count != utf8_trailing_byte_count(*previous) || getU32(previous) == invalid) {
       m_position--;
       m_value = pending_read;
       return;
@@ -180,45 +193,9 @@ private:
   }
 
   void extract_current() const {
-    m_value = static_cast<Utf8Type>(*m_position);
-    // we must not have a continuation character:
-    if (((uint8_t)m_value & 0xC0u) == 0x80u) {
+    m_value = getU32(m_position);
+    if (m_value == invalid) {
       m_value = STAR_UTF32_REPLACEMENT_CHAR;
-      return;
-    }
-    // see how many extra byts we have:
-    unsigned extra = utf8_trailing_byte_count(*m_position);
-    // extract the extra bits, 6 from each extra byte:
-    BaseIterator next(m_position);
-    for (unsigned c = 0; c < extra; ++c) {
-      ++next;
-      if (next == m_end) {
-        m_value = STAR_UTF32_REPLACEMENT_CHAR;
-        return;
-      }
-      m_value <<= 6;
-      auto entry = static_cast<uint8_t>(*next);
-      if ((entry & 0xC0u) != 0x80u) {
-        // Not a continuation char
-        m_value = STAR_UTF32_REPLACEMENT_CHAR;
-        return;
-      }
-      m_value += entry & 0x3Fu;
-    }
-    // we now need to remove a few of the leftmost bits, but how many depends
-    // upon how many extra bytes we've extracted:
-    static const Utf32Type masks[4] = {
-      0x7Fu, 0x7FFu, 0xFFFFu, 0x1FFFFFu
-    };
-    m_value &= masks[extra];
-    // check the result:
-    static const uint32_t overlong[4] = {
-      0x00u, 0x80u, 0x800u, 0x10000u
-    };
-    if ((uint32_t)m_value > (uint32_t)0x10FFFFu || (uint32_t)m_value < overlong[extra]) {
-      // Prevent overlong or invalid characters
-      m_value = STAR_UTF32_REPLACEMENT_CHAR;
-      return;
     }
   }
 
@@ -288,4 +265,4 @@ private:
   mutable BaseIterator m_position;
 };
 
-}// namespace Star
+} // namespace Star
