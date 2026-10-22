@@ -26,7 +26,7 @@
 #include "StarRootBase.hpp"
 
 namespace Star {
-  
+
 // if a ptr is returned, can be optionally used to format an error
 static const char* validateBasePath(std::string_view const& basePath) {
   if (AssetPath::isRemote(basePath))
@@ -90,7 +90,7 @@ static bool validatePath(AssetPath const& components, bool canContainSubPath, bo
   return true;
 }
 
-static bool validatePath(StringView path, bool canContainSubPath, bool canContainDirectives, bool throwing = true) {
+static bool validatePath(StringView path, bool /*canContainSubPath*/, bool canContainDirectives, bool throwing = true) {
   std::string_view const& str = path.utf8();
 
   size_t end = str.find_first_of(":?");
@@ -109,7 +109,7 @@ static bool validatePath(StringView path, bool canContainSubPath, bool canContai
       end = str.find_first_of('?', beg);
       if (end == NPos && beg + 1 != str.size())
         subPath = true;
-      else if (size_t len = end - beg)
+      else if (end != beg)
         subPath = true;
     }
   }
@@ -716,13 +716,37 @@ void Assets::cleanup() {
 
   double time = Time::monotonicTime();
 
+  // Reference images live longer than other assets, but only the most recently used ones that fit the pixel budget do.
+  HashSet<AssetData const*> keepLonger;
+  if (m_settings.referenceImageTimeToLive > m_settings.assetTimeToLive) {
+    List<pair<double, shared_ptr<ImageData>>> references;
+    for (auto const& pair : m_assetsCache) {
+      if (pair.second && pair.second->isReference)
+        if (auto image = as<ImageData>(pair.second))
+          references.append({image->time, image});
+    }
+    references.sort([](auto const& a, auto const& b) { return a.first > b.first; });
+
+    uint64_t pixels = 0;
+    for (auto const& reference : references) {
+      if (!reference.second->image)
+        continue;
+      uint64_t size = (uint64_t)reference.second->image->width() * reference.second->image->height();
+      if (pixels + size > m_settings.referenceImagePixelBudget)
+        continue;
+      pixels += size;
+      keepLonger.add(reference.second.get());
+    }
+  }
+
   auto it = makeSMutableMapIterator(m_assetsCache);
   while (it.hasNext()) {
     auto pair = it.next();
     // Don't clean up broken assets or queued assets.
     if (pair.second && !m_queue.contains(pair.first)) {
       double liveTime = time - pair.second->time;
-      if (liveTime > m_settings.assetTimeToLive) {
+      float timeToLive = keepLonger.contains(pair.second.get()) ? m_settings.referenceImageTimeToLive : m_settings.assetTimeToLive;
+      if (liveTime > timeToLive) {
         // If the asset should persist, just refresh the access time.
         if (pair.second->shouldPersist())
           pair.second->time = time;
@@ -1152,7 +1176,14 @@ Json Assets::applyJsonPatches(Json const& input, String const& path, List<pair<S
     auto patchAssetPath = AssetPath::split(pair.first);
     auto& patchBasePath = patchAssetPath.basePath;
     auto& patchSource = pair.second;
-    auto patchStream = patchSource->read(patchBasePath);
+    ByteArray patchStream;
+    try {
+      patchStream = patchSource->read(patchBasePath);
+    } catch (IOException const& e) {
+      // a directory source whose file was deleted during execution now skips the patch instead of failing the asset it patches
+      Logger::warn("Skipping patch {} in source '{}' that can no longer be read. Caused by: {}", pair.first, patchSource->metadata().value("name", ""), e.what());
+      continue;
+    }
     if (patchBasePath.endsWith(".lua")) {
       std::pair<AssetSource*, String> contextKey = make_pair(patchSource.get(), patchBasePath);
       RecursiveMutexLocker luaLocker(m_luaMutex);
@@ -1216,7 +1247,7 @@ EmbeddedAsset Assets::loadEmbeddedData(String const& basePath, bool const& asByt
   if (!m_allowRemote)
     throw AssetException("Embedded data is disallowed by config.");
   // assumes asset in question has already been checked for '/opensb_data;' embedded header. excludes that.
-  
+
   auto split = basePath.split(";");
   return loadEmbeddedData(split,1,asBytes);
 }
@@ -1237,7 +1268,7 @@ EmbeddedAsset Assets::loadEmbeddedData(StringList const& split, int const& start
   else if (split[startOffset+0] == "image" || split[startOffset+0] == "json" || split[startOffset+0] == "bin") {
     size_t indexOff = 0;
     EmbeddedCompressionMethod method = EmbeddedCompressionMethod::None;
-    if (split[startOffset+1].length() < 5 && split.size() >= (split[startOffset+0] == "image") ? 6 : 4 && EmbeddedCompressionMethodNames.hasRightValue(split[startOffset+1])) {
+    if (split[startOffset+1].length() < 5 && split.size() >= (split[startOffset+0] == "image" ? 6 : 4) && EmbeddedCompressionMethodNames.hasRightValue(split[startOffset+1])) {
       // the binary data is compressed.
       indexOff++;
       method = EmbeddedCompressionMethodNames.getLeft(split[startOffset+1]);
@@ -1477,7 +1508,7 @@ shared_ptr<Assets::AssetData> Assets::loadJson(AssetPath const& path) const {
     }
   } else {
     return unlockDuring([&]() {
-      if (AssetPath::isEmbedded(path.basePath)) {      
+      if (AssetPath::isEmbedded(path.basePath)) {
         auto newData = make_shared<JsonData>();
         newData->json = embeddedDataToJson(loadEmbeddedData(path.basePath));
         return newData;
@@ -1502,22 +1533,13 @@ shared_ptr<Assets::AssetData> Assets::loadImage(AssetPath const& path) const {
     if (!source)
       return {};
     StringMap<ImageConstPtr> references;
-    StringList referencePaths;
-
-    for (auto& directives : path.directives.list())
-      directives.loadOperations();
-
-    path.directives.forEach([&](auto const& entry, Directives const&) {
-      addImageOperationReferences(entry.operation, referencePaths);
-    }); // TODO: This can definitely be better, was changed quickly to support the new Directives.
-
-
-    for (auto const& ref : referencePaths) {
+    for (auto const& ref : path.directives.imageReferences()) {
       auto components = AssetPath::split(ref);
       validatePath(components, true, false);
       auto refImage = as<ImageData>(loadAsset(AssetId{AssetType::Image, std::move(components)}));
       if (!refImage)
         return {};
+      refImage->isReference = true;
       references[ref] = refImage->image;
     }
 

@@ -10,10 +10,13 @@
 #include "StarJsonRpc.hpp"
 
 namespace Star {
-  
+
 // update this in the rare case that backwards compat code has to be set up in TeamManager
 VersionNumber const TeamClientVersion = 1;
-  
+
+// The name and portrait rarely change, so they are only sent with the status this often (in seconds)
+double const FullPlayerDataInterval = 10.0;
+
 TeamClient::TeamClient(PlayerPtr mainPlayer, ClientContextPtr clientContext) {
   m_mainPlayer = mainPlayer;
   m_clientContext = clientContext;
@@ -26,6 +29,7 @@ TeamClient::TeamClient(PlayerPtr mainPlayer, ClientContextPtr clientContext) {
 
   m_statusUpdateRunning = false;
   m_statusUpdateTimer = 0;
+  m_fullWriteTimer = 0;
 }
 
 bool TeamClient::isTeamLeader() {
@@ -160,7 +164,7 @@ void TeamClient::pullFullUpdate() {
       m_fullUpdateRunning = false;
 
       m_teamManagerVersion = response.optInt("version").value(0);
-      
+
       m_teamUuid = response.optString("teamUuid").apply(construct<Uuid>());
 
       if (m_teamUuid) {
@@ -197,8 +201,10 @@ void TeamClient::statusUpdate() {
   JsonObject request;
   auto player = m_mainPlayer;
 
-  // TODO: write full player data less often?
-  writePlayerData(request, player, true);
+  bool fullWrite = Time::monotonicTime() - m_fullWriteTimer > FullPlayerDataInterval;
+  if (fullWrite)
+    m_fullWriteTimer = Time::monotonicTime();
+  writePlayerData(request, player, fullWrite);
 
   invokeRemote("team.updateStatus", request, [this](Json) {
       m_statusUpdateRunning = false;
@@ -211,6 +217,7 @@ List<TeamClient::Member> TeamClient::members() {
 
 void TeamClient::forceUpdate() {
   m_statusUpdateTimer = 0;
+  m_fullWriteTimer = 0;
   m_fullUpdateTimer = 0;
   m_pollInvitationsTimer = 0;
 }
@@ -256,8 +263,8 @@ void TeamClient::writePlayerData(JsonObject& request, PlayerPtr player, bool ful
   request["warpMode"] = WarpModeNames.getRight(mode);
 
   if (fullWrite) {
-    request["name"] = player->name();
-    request["portrait"] = jsonFromList(player->portrait(PortraitMode::Head), mem_fn(&Drawable::toJson));
+    request["name"] = player->teamName().value(player->name());
+    request["portrait"] = jsonFromList(player->teamPortrait().value(player->portrait(PortraitMode::Head)), mem_fn(&Drawable::toJson));
   }
 }
 
