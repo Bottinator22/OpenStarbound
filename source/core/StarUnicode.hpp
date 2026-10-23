@@ -56,9 +56,11 @@ public:
     return m_position;
   }
 
-  U32Type const& operator*() const {
+  U32Type const operator*() const {
     if (m_value == pending_read)
       extract_current();
+    if (m_value == invalid)
+      return STAR_UTF32_REPLACEMENT_CHAR;
     return m_value;
   }
 
@@ -118,7 +120,7 @@ private:
     // returns the invalid value where invalid
     U32Type value = static_cast<Utf8Type>(*at);
     // we must not have a continuation character, and the lead must be valid (>0xf8 is too long, 0xf5-0xf7 always encode invalid chars (above 0x10ffff))
-    if (((uint8_t)value & 0xC0u) == 0x80u || (uint8_t)value > 0xf5u) {
+    if (((uint8_t)value & 0xC0u) == 0x80u || (uint8_t)value >= 0xf5u) {
       return invalid;
     }
     // see how many extra byts we have:
@@ -141,13 +143,11 @@ private:
     // we now need to remove a few of the leftmost bits, but how many depends
     // upon how many extra bytes we've extracted:
     static const Utf32Type masks[4] = {
-      0x7Fu, 0x7FFu, 0xFFFFu, 0x1FFFFFu
-    };
+      0x7Fu, 0x7FFu, 0xFFFFu, 0x1FFFFFu};
     value &= masks[extra];
     // check the result:
     static const uint32_t overlong[4] = {
-      0x00u, 0x80u, 0x800u, 0x10000u
-    };
+      0x00u, 0x80u, 0x800u, 0x10000u};
     if ((uint32_t)value > (uint32_t)0x10FFFFu || (uint32_t)value < overlong[extra] || isUtf16Surrogate(value)) {
       // Prevent overlong or invalid characters
       return invalid;
@@ -157,19 +157,22 @@ private:
 
   void increment() {
     // skip high surrogate first if there is one:
-    m_value = pending_read;
     unsigned c = utf8_byte_count(*m_position);
     if (c > 1) {
       // ensure the sequence is valid (invalid sequences are treated as individual characters) by decoding the entire character
       // if it's invalid, just increment once to the next character
-      if (getU32(m_position) == invalid) {
+      if (m_value == pending_read) {
+        extract_current();
+      }
+      if (m_value == invalid) {
         ++m_position;
       } else {
-        std::advance(m_position,c);
+        std::advance(m_position, c);
       }
     } else {
       ++m_position;
     }
+    m_value = pending_read;
   }
 
   void decrement() {
@@ -179,12 +182,13 @@ private:
     while (((uint8_t)*--previous & 0xC0u) == 0x80u && previous != m_begin)
       ++count;
     // now check that the sequence was valid:
-    if (count != utf8_trailing_byte_count(*previous) || getU32(previous) == invalid) {
+    U32Type value;
+    if (count != utf8_trailing_byte_count(*previous) || (value = getU32(previous)) == invalid) {
       m_position--;
-      m_value = pending_read;
+      m_value = invalid;
       return;
     }
-    m_value = pending_read;
+    m_value = value;
     m_position = previous;
   }
 
@@ -194,9 +198,6 @@ private:
 
   void extract_current() const {
     m_value = getU32(m_position);
-    if (m_value == invalid) {
-      m_value = STAR_UTF32_REPLACEMENT_CHAR;
-    }
   }
 
   BaseIterator m_position;
@@ -265,4 +266,4 @@ private:
   mutable BaseIterator m_position;
 };
 
-} // namespace Star
+}// namespace Star
